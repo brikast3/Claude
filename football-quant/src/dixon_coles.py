@@ -195,3 +195,18 @@ def fair_odd_from_outcome(probs: dict[str, float]) -> float | None:
     if coeff <= 0:
         return None
     return (1 - probs["P"]) / coeff
+
+
+def settle_return(family: str, side: str, line: float, h: int, a: int, odd: float) -> float:
+    """Actual payout multiplier for a 1-unit stake on ONE resolved match, splitting
+    a quarter line into two half-stake legs. 0 = full loss, 0.5 = half loss,
+    1.0 = push (stake refunded), (1+odd)/2 = half win, odd = full win. Mirrors
+    settleAsian() in the production engine bit for bit.
+    """
+    parts = split_line(line)
+    ret = 0.0
+    for part in parts:
+        outcome = _settle_base(family, side, part, h, a)
+        leg_return = odd if outcome == "W" else (1.0 if outcome == "P" else 0.0)
+        ret += leg_return / len(parts)
+    return ret

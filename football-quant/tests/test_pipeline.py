@@ -17,7 +17,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.backtest import BacktestConfig, run_backtest
-from src.dixon_coles import DixonColesModel, fair_odd_from_outcome, outcome_probabilities, split_line
+from src.dixon_coles import DixonColesModel, fair_odd_from_outcome, outcome_probabilities, settle_return, split_line
 from src.market import kelly_stake, no_vig_fair_odds_2way, no_vig_fair_probs_3way
 
 
@@ -107,6 +107,35 @@ def test_kelly_stake_bounds():
     assert 0 < stake <= 30.0  # capped at 3% of bankroll
 
 
+def test_settle_return_asian_handicap():
+    # Home -0.25 (quarter line splits into -0.5 and 0), draw actual result -> half loss.
+    assert abs(settle_return("AH", "HOME", -0.25, 1, 1, 2.0) - 0.5) < 1e-9
+    # Home -0.25, home wins by 1 -> covers both split lines -> full win.
+    assert abs(settle_return("AH", "HOME", -0.25, 2, 1, 2.0) - 2.0) < 1e-9
+    # Home 0 (pick'em), draw -> clean push, stake back.
+    assert abs(settle_return("AH", "HOME", 0.0, 1, 1, 2.0) - 1.0) < 1e-9
+    # Away +0.25 (mirror of home -0.25), draw actual result -> half win.
+    assert abs(settle_return("AH", "AWAY", 0.25, 1, 1, 2.0) - 1.5) < 1e-9
+    # Away +0.25, home wins by 1 -> away side loses outright on both split lines.
+    assert abs(settle_return("AH", "AWAY", 0.25, 2, 1, 2.0) - 0.0) < 1e-9
+
+
+def test_walk_forward_backtest_ah_market_runs():
+    df = make_synthetic_league(n_teams=10, n_rounds=4, seed=4)
+    rng = np.random.default_rng(5)
+    # Bolt on a plausible pick'em-ish AH line with a small overround, just to exercise
+    # the 'ah' code path end to end - not a claim about realistic AH line selection.
+    df["AHh"] = rng.choice([-0.25, 0.0, 0.25], size=len(df))
+    df["B365AHH"] = rng.uniform(1.85, 2.05, size=len(df))
+    df["B365AHA"] = rng.uniform(1.85, 2.05, size=len(df))
+    cfg = BacktestConfig(market="ah", refit_every_days=14, min_train_matches=60, ev_min=0.0, ev_max=1.0)
+    result = run_backtest(df, cfg)
+    assert result.n_bets >= 0
+    if result.n_bets:
+        assert (result.bets["stake"] > 0).all()
+        assert result.bets["return_multiplier"].between(0, result.bets["odd"]).all()
+
+
 def test_dixon_coles_fit_and_probabilities():
     df = make_synthetic_league(n_teams=8, n_rounds=2, seed=1)
     model = DixonColesModel().fit(df, xi=0.0018)
@@ -138,6 +167,8 @@ if __name__ == "__main__":
     test_split_line()
     test_no_vig_helpers()
     test_kelly_stake_bounds()
+    test_settle_return_asian_handicap()
+    test_walk_forward_backtest_ah_market_runs()
     test_dixon_coles_fit_and_probabilities()
     test_walk_forward_backtest_runs_end_to_end()
     print("All tests passed.")

@@ -81,15 +81,23 @@ pip install -r requirements.txt
 ```bash
 python run_backtest.py --league E0 --seasons 2021 2122 2223 2324 2425 --market 1x2
 python run_backtest.py --league SP1 --seasons 2223 2324 2425 --market ou25 --ev-min 0.03
+python run_backtest.py --league E0 --seasons 2021 2122 2223 2324 2425 --market ah
 ```
 
 League codes are football-data.co.uk's own: `E0` EPL, `E1` Championship,
 `SP1` La Liga, `D1` Bundesliga, `I1` Serie A, `F1` Ligue 1, etc. — full list at
 football-data.co.uk/data.php. Season codes are 4 digits, e.g. `2425` = 2024/25.
 
-Key flags (see `--help` for all of them): `--market {1x2,ou25}`,
+Key flags (see `--help` for all of them): `--market {1x2,ou25,ah}`,
 `--ev-min`/`--ev-max` (EV band for a bet to qualify), `--refit-every-days`,
 `--xi` (time-decay rate), `--kelly-fraction`.
+
+`ah` (Asian handicap) is worth trying first if you only try one: bookmaker
+margins there run roughly ~2% vs 1X2's ~5-6%, which is exactly why the
+production n8n engine this project validates targets Asian lines rather than
+match-odds markets. football-data.co.uk gives exactly one AH line per match
+(AHh/B365AHH/B365AHA) — there's no line-shopping across multiple lines the
+way the live engine's multi-line scout does.
 
 ## Reading the report
 
@@ -122,10 +130,6 @@ caveats above.
 
 ## Extending
 
-- **Asian handicap backtest**: `src/dixon_coles.py` already has the settlement
-  math (`outcome_probabilities`, `split_line`) needed for AH bets; wiring it
-  into `src/backtest.py` as a third market is mechanical once you've confirmed
-  `AHh`/`B365AHH`/`B365AHA` column coverage for your target leagues/seasons.
 - **CLV tracking**: this backtest bets at the closing line, so there's no
   opening-vs-closing comparison. football-data.co.uk does carry both an
   opening-ish price and closing price from some bookmakers (e.g. Pinnacle

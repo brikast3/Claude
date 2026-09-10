@@ -26,7 +26,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--league", required=True, help="football-data.co.uk league code, e.g. E0")
     ap.add_argument("--seasons", required=True, nargs="+", help="season codes, e.g. 2223 2324 2425")
-    ap.add_argument("--market", default="1x2", choices=["1x2", "ou25"])
+    ap.add_argument("--market", default="1x2", choices=["1x2", "ou25", "ah"])
     ap.add_argument("--cache-dir", default="data_cache")
     ap.add_argument("--xi", type=float, default=0.0018)
     ap.add_argument("--refit-every-days", type=int, default=7)

@@ -6,12 +6,15 @@ on data from after the bet it is evaluating, refits on a rolling cadence exactly
 like a live system would, and reports a bootstrap confidence interval on ROI so
 a lucky run on one league/season doesn't get mistaken for a real edge.
 
-Supported markets: '1x2' (B365H/B365D/B365A) and 'ou25' (B365>2.5/B365<2.5).
-Both are almost always present in football-data.co.uk files; Asian handicap
-columns (AHh/B365AHH/B365AHA) exist only for recent seasons of major leagues -
-the settlement math for it already lives in dixon_coles.outcome_probabilities,
-wiring it into this loop is a small, mechanical extension once you have enough
-AH-column coverage to bother.
+Supported markets: '1x2' (B365H/B365D/B365A), 'ou25' (B365>2.5/B365<2.5), and
+'ah' (Asian handicap: AHh/B365AHH/B365AHA). All three are usually present in
+football-data.co.uk files for the top divisions of major leagues; AH column
+coverage is thinner for lower divisions and older seasons, so check
+`available_markets()` before assuming it's there for your target data.
+
+'ah' is the market worth the most attention: Asian handicap margins run much
+tighter than 1X2's (typically ~2% vs ~5-6%), which is exactly why the
+production n8n engine targets it instead of match-odds markets.
 """
 from __future__ import annotations
 
@@ -21,13 +24,19 @@ from datetime import timedelta
 import numpy as np
 import pandas as pd
 
-from .dixon_coles import DixonColesModel, match_odds_probs, outcome_probabilities
+from .dixon_coles import (
+    DixonColesModel,
+    fair_odd_from_outcome,
+    match_odds_probs,
+    outcome_probabilities,
+    settle_return,
+)
 from .market import kelly_stake, no_vig_fair_odds_2way, no_vig_fair_probs_3way
 
 
 @dataclass
 class BacktestConfig:
-    market: str = "1x2"  # '1x2' or 'ou25'
+    market: str = "1x2"  # '1x2', 'ou25', or 'ah'
     xi: float = 0.0018
     refit_every_days: int = 7
     min_train_matches: int = 150
@@ -86,7 +95,8 @@ def _evaluate_1x2(grid, row, cfg: BacktestConfig, reliability: float):
         if cfg.ev_min <= ev <= cfg.ev_max:
             if best is None or ev > best["ev"]:
                 won = row["FTR"] == side
-                best = {"side": side, "odd": odds[side], "calibrated_prob": calibrated, "ev": ev, "won": won}
+                ret = odds[side] if won else 0.0
+                best = {"side": side, "odd": odds[side], "calibrated_prob": calibrated, "ev": ev, "return_multiplier": ret}
     return best
 
 
@@ -108,8 +118,46 @@ def _evaluate_ou25(grid, row, cfg: BacktestConfig, reliability: float):
         if cfg.ev_min <= ev <= cfg.ev_max:
             if best is None or ev > best["ev"]:
                 won = (total_goals > 2.5) if side == "OVER" else (total_goals < 2.5)
-                best = {"side": side, "odd": odd, "calibrated_prob": calibrated, "ev": ev, "won": won}
+                ret = odd if won else 0.0
+                best = {"side": side, "odd": odd, "calibrated_prob": calibrated, "ev": ev, "return_multiplier": ret}
     return best
+
+
+def _evaluate_ah(grid, row, cfg: BacktestConfig, reliability: float):
+    """Asian handicap: football-data.co.uk gives exactly one line (AHh, home
+    perspective) with both sides' Bet365 odds - unlike the live n8n engine's
+    multi-line scout, there's no line-shopping here, just this one line to
+    accept or skip.
+    """
+    line, home_odd, away_odd = row.get("AHh"), row.get("B365AHH"), row.get("B365AHA")
+    if pd.isna(line) or pd.isna(home_odd) or pd.isna(away_odd):
+        return None
+    home_probs = outcome_probabilities(grid, "AH", "HOME", line)
+    away_probs = outcome_probabilities(grid, "AH", "AWAY", -line)
+    model_fair_home = fair_odd_from_outcome(home_probs)
+    model_fair_away = fair_odd_from_outcome(away_probs)
+    if not model_fair_home or not model_fair_away:
+        return None
+    market_fair_home, market_fair_away = no_vig_fair_odds_2way(home_odd, away_odd)
+    w = _model_weight(reliability, cfg)
+
+    best = None
+    legs = (
+        ("HOME", home_odd, model_fair_home, market_fair_home, line),
+        ("AWAY", away_odd, model_fair_away, market_fair_away, -line),
+    )
+    for side, odd, model_fair, market_fair, bet_line in legs:
+        calibrated_prob = w * (1 / model_fair) + (1 - w) * (1 / market_fair)
+        calibrated_fair = 1 / calibrated_prob
+        ev = odd / calibrated_fair - 1
+        if cfg.ev_min <= ev <= cfg.ev_max:
+            if best is None or ev > best["ev"]:
+                ret = settle_return("AH", side, bet_line, int(row["FTHG"]), int(row["FTAG"]), odd)
+                best = {"side": side, "odd": odd, "calibrated_prob": calibrated_prob, "ev": ev, "return_multiplier": ret}
+    return best
+
+
+_EVALUATORS = {"1x2": _evaluate_1x2, "ou25": _evaluate_ou25, "ah": _evaluate_ah}
 
 
 def run_backtest(matches: pd.DataFrame, cfg: BacktestConfig | None = None) -> BacktestResult:
@@ -119,7 +167,9 @@ def run_backtest(matches: pd.DataFrame, cfg: BacktestConfig | None = None) -> Ba
     start = dates.min() + timedelta(days=1)
     end = dates.max()
 
-    evaluator = _evaluate_1x2 if cfg.market == "1x2" else _evaluate_ou25
+    if cfg.market not in _EVALUATORS:
+        raise ValueError(f"unknown market {cfg.market!r}, expected one of {sorted(_EVALUATORS)}")
+    evaluator = _EVALUATORS[cfg.market]
     rows = []
     cursor = start
     while cursor <= end:
@@ -148,7 +198,8 @@ def run_backtest(matches: pd.DataFrame, cfg: BacktestConfig | None = None) -> Ba
             )
             if stake <= 0:
                 continue
-            profit = stake * (pick["odd"] - 1) if pick["won"] else -stake
+            ret = pick["return_multiplier"]
+            profit = stake * (ret - 1)
             rows.append(
                 {
                     "Date": row["Date"],
@@ -161,7 +212,8 @@ def run_backtest(matches: pd.DataFrame, cfg: BacktestConfig | None = None) -> Ba
                     "ev": pick["ev"],
                     "reliability": reliability,
                     "stake": stake,
-                    "won": pick["won"],
+                    "return_multiplier": ret,
+                    "won": ret >= 1.0,  # counts a push as a non-loss, not as a full win
                     "profit": profit,
                 }
             )
@@ -173,7 +225,7 @@ def run_backtest(matches: pd.DataFrame, cfg: BacktestConfig | None = None) -> Ba
     total_staked = float(bets["stake"].sum())
     total_profit = float(bets["profit"].sum())
     roi = total_profit / total_staked if total_staked > 0 else float("nan")
-    hit_rate = float(bets["won"].mean())
+    hit_rate = float((bets["return_multiplier"] > 1.0).mean())
     per_bet_roi = (bets["profit"] / bets["stake"]).to_numpy()
     ci = _bootstrap_roi_ci(per_bet_roi)
     return BacktestResult(bets, len(bets), total_staked, total_profit, roi, hit_rate, ci)

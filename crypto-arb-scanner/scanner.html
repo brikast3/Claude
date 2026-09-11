@@ -101,6 +101,12 @@
 </div>
 
 <div class="panel">
+  <b>Best edge ever seen (even if below threshold)</b>
+  <div class="sub">This is what makes a zero-opportunity run interpretable: "never came close" and "missed by 5 basis points every time" look identical in the log below, but mean very different things.</div>
+  <div id="bestEverTables"></div>
+</div>
+
+<div class="panel">
   <b>Detected opportunities log</b> <span class="sub">(above your threshold; capped at last 500)</span>
   <div class="scroll">
     <table>
@@ -260,6 +266,21 @@ function logOpportunity(type, detail, edgePct, repeatKey) {
   if (opportunityLog.length > 500) opportunityLog.pop();
 }
 
+// Tracks the best (highest) net edge ever observed per pair/path, REGARDLESS
+// of whether it crossed the logging threshold. An empty opportunity log is
+// ambiguous on its own - "never came close" and "missed a +0.09% edge by
+// a hair every time" look identical in the log but mean very different
+// things. This is exported alongside the log so a null result stays
+// honestly interpretable.
+const bestEverCross = {}; // pair -> {edgePct, buy, sell, ts}
+const bestEverTri = {};   // "exId:A"|"exId:B" -> {edgePct, exchange, path, ts}
+
+function updateBestEver(store, key, edgePct, extra) {
+  if (!store[key] || edgePct > store[key].edgePct) {
+    store[key] = { edgePct, ts: new Date().toISOString(), ...extra };
+  }
+}
+
 function computeCrossEdges(threshold) {
   const rows = [];
   for (const pair of PAIRS) {
@@ -273,6 +294,7 @@ function computeCrossEdges(threshold) {
         const net = (byExch[b].bid / byExch[a].ask) * (1 - feeA) * (1 - feeB);
         const edgePct = (net - 1) * 100;
         if (!best || edgePct > best.edgePct) best = { pair, buy: a, sell: b, edgePct, ask: byExch[a].ask, bid: byExch[b].bid };
+        updateBestEver(bestEverCross, pair, edgePct, { buy: EXCHANGES[a].name, sell: EXCHANGES[b].name });
         if (edgePct >= threshold) {
           const key = `cross:${pair}:${a}->${b}`;
           logOpportunity("cross-exchange", `${pair}: buy ${EXCHANGES[a].name} @ ${byExch[a].ask}, sell ${EXCHANGES[b].name} @ ${byExch[b].bid}`, edgePct, key);
@@ -302,6 +324,8 @@ function computeTriangular(threshold) {
     const edgeB = (finalB - 1) * 100;
 
     rows.push({ exId, edgeA, edgeB });
+    updateBestEver(bestEverTri, `${exId}:A`, edgeA, { exchange: EXCHANGES[exId].name, path: "USDT→BTC→ETH→USDT" });
+    updateBestEver(bestEverTri, `${exId}:B`, edgeB, { exchange: EXCHANGES[exId].name, path: "USDT→ETH→BTC→USDT" });
     if (edgeA >= threshold) logOpportunity("triangular", `${EXCHANGES[exId].name}: USDT→BTC→ETH→USDT`, edgeA, `tri:${exId}:A`);
     if (edgeB >= threshold) logOpportunity("triangular", `${EXCHANGES[exId].name}: USDT→ETH→BTC→USDT`, edgeB, `tri:${exId}:B`);
   }
@@ -335,6 +359,25 @@ function renderTriangular(triRows) {
     html += `<tr><td>${EXCHANGES[r.exId].name}</td>` +
       `<td class="${r.edgeA > 0 ? "edge-pos" : "edge-neg"}">${(r.edgeA >= 0 ? "+" : "") + r.edgeA.toFixed(3)}%</td>` +
       `<td class="${r.edgeB > 0 ? "edge-pos" : "edge-neg"}">${(r.edgeB >= 0 ? "+" : "") + r.edgeB.toFixed(3)}%</td></tr>`;
+  }
+  html += `</tbody></table>`;
+  container.innerHTML = html;
+}
+
+function renderBestEver() {
+  const container = document.getElementById("bestEverTables");
+  let html = `<table><thead><tr><th>Type</th><th>Detail</th><th>Best edge seen</th><th>When</th></tr></thead><tbody>`;
+  for (const pair of PAIRS) {
+    const b = bestEverCross[pair];
+    html += `<tr><td>cross-exchange</td><td>${pair}${b ? `: ${b.buy}→${b.sell}` : ""}</td>` +
+      `<td class="${b && b.edgePct > 0 ? "edge-pos" : "edge-neg"}">${b ? (b.edgePct >= 0 ? "+" : "") + b.edgePct.toFixed(4) + "%" : "—"}</td>` +
+      `<td class="sub">${b ? b.ts.replace("T", " ").slice(0, 19) : "—"}</td></tr>`;
+  }
+  for (const key of Object.keys(bestEverTri)) {
+    const b = bestEverTri[key];
+    html += `<tr><td>triangular</td><td>${b.exchange}: ${b.path}</td>` +
+      `<td class="${b.edgePct > 0 ? "edge-pos" : "edge-neg"}">${(b.edgePct >= 0 ? "+" : "") + b.edgePct.toFixed(4) + "%"}</td>` +
+      `<td class="sub">${b.ts.replace("T", " ").slice(0, 19)}</td></tr>`;
   }
   html += `</tbody></table>`;
   container.innerHTML = html;
@@ -381,6 +424,7 @@ async function pollOnce() {
   renderStatus();
   renderSnapshot(crossRows);
   renderTriangular(triRows);
+  renderBestEver();
   renderLog();
   renderStats(startedAt);
 }
@@ -409,8 +453,11 @@ function exportLog(e) {
     exportedAt: new Date().toISOString(),
     pollCount,
     fees: fees(),
+    exchangeStatus,
+    bestEverCross,
+    bestEverTri,
     opportunityLog,
-    note: "Detected via top-of-book comparison only. Does not account for depth/slippage, execution latency, or (for cross-exchange) fund-transfer time and price risk.",
+    note: "Detected via top-of-book comparison only. Does not account for depth/slippage, execution latency, or (for cross-exchange) fund-transfer time and price risk. exchangeStatus shows which exchanges were actually reachable from this browser (CORS varies) - an empty opportunityLog only means something if most exchanges show 'ok' here. bestEverCross/bestEverTri show the highest net edge seen per pair/path even when it never crossed the logging threshold, so a null result stays interpretable (never came close vs. missed narrowly every time).",
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);

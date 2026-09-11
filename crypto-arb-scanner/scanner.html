@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crypto Arbitrage Scanner (local, no install)</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #2a2f3a; --text: #e6e9ef; --muted: #8b93a3;
+    --green: #34d399; --red: #f87171; --amber: #fbbf24; --accent: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, Segoe UI, Roboto, sans-serif; padding: 20px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .warn { background: #2a1f10; border: 1px solid #6b4a1a; color: #f5c97a; padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 13px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 16px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  input, select, button { background: #0f1115; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 13px; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); color: #0f1115; border: none; font-weight: 600; }
+  button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.stop { background: var(--red); color: #0f1115; border: none; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; }
+  .status-ok { color: var(--green); }
+  .status-bad { color: var(--red); }
+  .status-pending { color: var(--muted); }
+  .edge-pos { color: var(--green); font-weight: 600; }
+  .edge-neg { color: var(--muted); }
+  .scroll { max-height: 320px; overflow-y: auto; }
+  .stats { display: flex; gap: 24px; flex-wrap: wrap; }
+  .stat { background: #0f1115; border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; min-width: 120px; }
+  .stat .n { font-size: 20px; font-weight: 700; }
+  .stat .l { font-size: 11px; color: var(--muted); }
+  .fee-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px,1fr)); gap: 10px; }
+  code { background: #0f1115; padding: 1px 5px; border-radius: 4px; }
+  a.export { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>Crypto Arbitrage Scanner — local, browser-only, no install</h1>
+<div class="sub">Runs entirely in this browser tab. Every request below goes directly from your machine to the exchange, not through any server of mine — I never see your traffic. Close the tab to stop.</div>
+
+<div class="warn">
+<b>What this measures, and what it does NOT prove:</b> this scanner compares live top-of-book (best bid/ask) prices across exchanges and computes the net edge after each exchange's <i>taker</i> fee. That's it. It does NOT account for: slippage below the top of the book on larger size, network/execution latency between seeing a price and actually trading it, the time and price risk of moving funds between exchanges for cross-exchange arbitrage, or competition from faster bots already working the same spread. A detected "opportunity" here is evidence something is worth investigating further — it is not evidence you could have captured it. Run this for a while (15–30+ minutes), export the log, and send it back for an honest read on how often/how large/how persistent anything real-looking actually was.
+</div>
+
+<div class="panel">
+  <div class="row">
+    <div>
+      <label>Poll interval</label>
+      <select id="interval">
+        <option value="5000">5s</option>
+        <option value="8000" selected>8s</option>
+        <option value="15000">15s</option>
+        <option value="30000">30s</option>
+      </select>
+    </div>
+    <div>
+      <label>Min net edge to log (%)</label>
+      <input id="threshold" type="number" value="0.10" step="0.01" style="width:80px">
+    </div>
+    <div>
+      <button class="primary" id="startBtn">Start scanning</button>
+      <button class="stop" id="stopBtn" disabled>Stop</button>
+    </div>
+    <div>
+      <a class="export" href="#" id="exportLink">Export log as JSON</a>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <b>Taker fees (edit to your real account tier — these are illustrative defaults, not guarantees)</b>
+  <div class="fee-grid" id="feeGrid" style="margin-top:8px"></div>
+</div>
+
+<div class="panel">
+  <b>Exchange status</b>
+  <table><thead><tr><th>Exchange</th><th>Status</th><th>Last error</th></tr></thead>
+  <tbody id="statusBody"></tbody></table>
+</div>
+
+<div class="panel">
+  <b>Live cross-exchange snapshot</b>
+  <div class="sub">Best bid/ask per exchange per pair, and the best net edge found this poll (buy low, sell high, after both fees).</div>
+  <div id="snapshotTables"></div>
+</div>
+
+<div class="panel">
+  <b>Triangular arbitrage snapshot (within one exchange — no transfer risk, but still real slippage/latency risk)</b>
+  <div id="triSnapshot"></div>
+</div>
+
+<div class="panel">
+  <div class="stats" id="statsBar"></div>
+</div>
+
+<div class="panel">
+  <b>Detected opportunities log</b> <span class="sub">(above your threshold; capped at last 500)</span>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Time</th><th>Type</th><th>Detail</th><th>Net edge</th><th>Repeat count</th></tr></thead>
+      <tbody id="logBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Config: pairs to track, per-exchange symbol names (formats differ per
+// exchange), and default taker fees. Fees are illustrative starting points -
+// real fees depend on your account tier/volume/native-token discounts, so
+// they're editable inputs, not hardcoded truth.
+// ---------------------------------------------------------------------------
+const PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"];
+
+const EXCHANGES = {
+  binance:  { name: "Binance",  defaultFee: 0.0010, symbols: { "BTC/USDT": "BTCUSDT", "ETH/USDT": "ETHUSDT", "SOL/USDT": "SOLUSDT" } },
+  kraken:   { name: "Kraken",   defaultFee: 0.0026, symbols: { "BTC/USDT": "XBTUSDT", "ETH/USDT": "ETHUSDT", "SOL/USDT": "SOLUSDT" } },
+  coinbase: { name: "Coinbase", defaultFee: 0.0060, symbols: { "BTC/USDT": "BTC-USDT", "ETH/USDT": "ETH-USDT", "SOL/USDT": "SOL-USDT" } },
+  bybit:    { name: "Bybit",    defaultFee: 0.0010, symbols: { "BTC/USDT": "BTCUSDT", "ETH/USDT": "ETHUSDT", "SOL/USDT": "SOLUSDT" } },
+  kucoin:   { name: "KuCoin",   defaultFee: 0.0010, symbols: { "BTC/USDT": "BTC-USDT", "ETH/USDT": "ETH-USDT", "SOL/USDT": "SOL-USDT" } },
+  bitstamp: { name: "Bitstamp", defaultFee: 0.0030, symbols: { "BTC/USDT": "btcusdt", "ETH/USDT": "ethusdt", "SOL/USDT": "solusdt" } },
+};
+
+// Triangular paths: USDT -> BTC -> ETH -> USDT and the reverse, on exchanges
+// that expose a direct BTC-quoted ETH pair with predictable naming. Extend
+// this object with the same shape to add more exchanges/paths.
+const TRI_PATHS = {
+  binance: { btcusdt: "BTCUSDT", ethusdt: "ETHUSDT", ethbtc: "ETHBTC" },
+  bybit:   { btcusdt: "BTCUSDT", ethusdt: "ETHUSDT", ethbtc: "ETHBTC" },
+  kucoin:  { btcusdt: "BTC-USDT", ethusdt: "ETH-USDT", ethbtc: "ETH-BTC" },
+};
+
+// ---------------------------------------------------------------------------
+// Per-exchange fetchers. Each returns {bid, ask} or throws. Endpoints are
+// public, unauthenticated market data - no API key needed anywhere here.
+// CORS support for browser-side calls varies by exchange and can change
+// without notice; a failing exchange is marked BLOCKED/ERROR in the status
+// table rather than breaking the rest of the scan.
+// ---------------------------------------------------------------------------
+async function fetchJson(url) {
+  const res = await fetch(url, { method: "GET" });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
+const FETCHERS = {
+  async binance(symbol) {
+    const d = await fetchJson(`https://api.binance.com/api/v3/ticker/bookTicker?symbol=${symbol}`);
+    return { bid: parseFloat(d.bidPrice), ask: parseFloat(d.askPrice) };
+  },
+  async kraken(symbol) {
+    const d = await fetchJson(`https://api.kraken.com/0/public/Ticker?pair=${symbol}`);
+    if (d.error && d.error.length) throw new Error(d.error.join("; "));
+    const key = Object.keys(d.result)[0];
+    const r = d.result[key];
+    return { bid: parseFloat(r.b[0]), ask: parseFloat(r.a[0]) };
+  },
+  async coinbase(symbol) {
+    const d = await fetchJson(`https://api.exchange.coinbase.com/products/${symbol}/ticker`);
+    return { bid: parseFloat(d.bid), ask: parseFloat(d.ask) };
+  },
+  async bybit(symbol) {
+    const d = await fetchJson(`https://api.bybit.com/v5/market/tickers?category=spot&symbol=${symbol}`);
+    const r = d.result.list[0];
+    return { bid: parseFloat(r.bid1Price), ask: parseFloat(r.ask1Price) };
+  },
+  async kucoin(symbol) {
+    const d = await fetchJson(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${symbol}`);
+    return { bid: parseFloat(d.data.bestBid), ask: parseFloat(d.data.bestAsk) };
+  },
+  async bitstamp(symbol) {
+    const d = await fetchJson(`https://www.bitstamp.net/api/v2/ticker/${symbol}/`);
+    return { bid: parseFloat(d.bid), ask: parseFloat(d.ask) };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let running = false;
+let timer = null;
+let pollCount = 0;
+const exchangeStatus = {}; // id -> {state: 'pending'|'ok'|'bad', error}
+const latest = {}; // pair -> exchangeId -> {bid, ask}
+const triLatest = {}; // exchangeId -> {btcusdt, ethusdt, ethbtc}
+const opportunityLog = []; // {ts, type, detail, edgePct, repeatKey}
+const seenKeys = {}; // repeatKey -> count of consecutive polls seen (persistence proxy)
+const seenThisPoll = new Set();
+
+function fees() {
+  const out = {};
+  for (const id of Object.keys(EXCHANGES)) {
+    const el = document.getElementById("fee_" + id);
+    out[id] = el ? (parseFloat(el.value) / 100) : EXCHANGES[id].defaultFee;
+  }
+  return out;
+}
+
+function renderFeeGrid() {
+  const grid = document.getElementById("feeGrid");
+  grid.innerHTML = Object.entries(EXCHANGES).map(([id, ex]) => `
+    <div>
+      <label>${ex.name} taker fee %</label>
+      <input id="fee_${id}" type="number" value="${(ex.defaultFee * 100).toFixed(3)}" step="0.001" style="width:100%">
+    </div>
+  `).join("");
+}
+
+function renderStatus() {
+  const body = document.getElementById("statusBody");
+  body.innerHTML = Object.entries(EXCHANGES).map(([id, ex]) => {
+    const s = exchangeStatus[id] || { state: "pending", error: "" };
+    const cls = s.state === "ok" ? "status-ok" : s.state === "bad" ? "status-bad" : "status-pending";
+    const label = s.state === "ok" ? "OK" : s.state === "bad" ? "BLOCKED / ERROR" : "not polled yet";
+    return `<tr><td>${ex.name}</td><td class="${cls}">${label}</td><td class="sub">${s.error || ""}</td></tr>`;
+  }).join("");
+}
+
+async function pollExchangePair(exId, pair) {
+  const symbol = EXCHANGES[exId].symbols[pair];
+  try {
+    const r = await FETCHERS[exId](symbol);
+    if (!(r.bid > 0) || !(r.ask > 0)) throw new Error("bad price data");
+    latest[pair] = latest[pair] || {};
+    latest[pair][exId] = r;
+    exchangeStatus[exId] = { state: "ok", error: "" };
+  } catch (e) {
+    exchangeStatus[exId] = { state: "bad", error: String(e.message || e) };
+  }
+}
+
+async function pollTriangular(exId) {
+  const paths = TRI_PATHS[exId];
+  if (!paths) return;
+  try {
+    const [btcusdt, ethusdt, ethbtc] = await Promise.all([
+      FETCHERS[exId](paths.btcusdt),
+      FETCHERS[exId](paths.ethusdt),
+      FETCHERS[exId](paths.ethbtc),
+    ]);
+    triLatest[exId] = { btcusdt, ethusdt, ethbtc };
+  } catch (e) {
+    // leave stale/missing - status table already reflects this exchange's health
+  }
+}
+
+function logOpportunity(type, detail, edgePct, repeatKey) {
+  seenThisPoll.add(repeatKey);
+  seenKeys[repeatKey] = (seenKeys[repeatKey] || 0) + 1;
+  opportunityLog.unshift({ ts: new Date().toISOString(), type, detail, edgePct, repeatCount: seenKeys[repeatKey] });
+  if (opportunityLog.length > 500) opportunityLog.pop();
+}
+
+function computeCrossEdges(threshold) {
+  const rows = [];
+  for (const pair of PAIRS) {
+    const byExch = latest[pair] || {};
+    const ids = Object.keys(byExch);
+    let best = null;
+    for (const a of ids) {
+      for (const b of ids) {
+        if (a === b) continue;
+        const feeA = fees()[a], feeB = fees()[b];
+        const net = (byExch[b].bid / byExch[a].ask) * (1 - feeA) * (1 - feeB);
+        const edgePct = (net - 1) * 100;
+        if (!best || edgePct > best.edgePct) best = { pair, buy: a, sell: b, edgePct, ask: byExch[a].ask, bid: byExch[b].bid };
+        if (edgePct >= threshold) {
+          const key = `cross:${pair}:${a}->${b}`;
+          logOpportunity("cross-exchange", `${pair}: buy ${EXCHANGES[a].name} @ ${byExch[a].ask}, sell ${EXCHANGES[b].name} @ ${byExch[b].bid}`, edgePct, key);
+        }
+      }
+    }
+    rows.push({ pair, byExch, best });
+  }
+  return rows;
+}
+
+function computeTriangular(threshold) {
+  const rows = [];
+  for (const exId of Object.keys(TRI_PATHS)) {
+    const t = triLatest[exId];
+    if (!t || !t.btcusdt || !t.ethusdt || !t.ethbtc) continue;
+    const fee = fees()[exId];
+    // Path A: USDT -> BTC -> ETH -> USDT
+    const btcAmt = (1 / t.btcusdt.ask) * (1 - fee);
+    const ethAmt = (btcAmt / t.ethbtc.ask) * (1 - fee);
+    const finalA = (ethAmt * t.ethusdt.bid) * (1 - fee);
+    const edgeA = (finalA - 1) * 100;
+    // Path B (reverse): USDT -> ETH -> BTC -> USDT
+    const ethAmtB = (1 / t.ethusdt.ask) * (1 - fee);
+    const btcAmtB = (ethAmtB * t.ethbtc.bid) * (1 - fee);
+    const finalB = (btcAmtB * t.btcusdt.bid) * (1 - fee);
+    const edgeB = (finalB - 1) * 100;
+
+    rows.push({ exId, edgeA, edgeB });
+    if (edgeA >= threshold) logOpportunity("triangular", `${EXCHANGES[exId].name}: USDT→BTC→ETH→USDT`, edgeA, `tri:${exId}:A`);
+    if (edgeB >= threshold) logOpportunity("triangular", `${EXCHANGES[exId].name}: USDT→ETH→BTC→USDT`, edgeB, `tri:${exId}:B`);
+  }
+  return rows;
+}
+
+function renderSnapshot(crossRows) {
+  const container = document.getElementById("snapshotTables");
+  let html = `<table><thead><tr><th>Pair</th>`;
+  for (const id of Object.keys(EXCHANGES)) html += `<th>${EXCHANGES[id].name} bid/ask</th>`;
+  html += `<th>Best net edge</th></tr></thead><tbody>`;
+  for (const row of crossRows) {
+    html += `<tr><td>${row.pair}</td>`;
+    for (const id of Object.keys(EXCHANGES)) {
+      const d = row.byExch[id];
+      html += `<td>${d ? d.bid.toLocaleString() + " / " + d.ask.toLocaleString() : "—"}</td>`;
+    }
+    const b = row.best;
+    const cls = b && b.edgePct > 0 ? "edge-pos" : "edge-neg";
+    html += `<td class="${cls}">${b ? (b.edgePct >= 0 ? "+" : "") + b.edgePct.toFixed(3) + "% (" + EXCHANGES[b.buy].name + "→" + EXCHANGES[b.sell].name + ")" : "—"}</td></tr>`;
+  }
+  html += `</tbody></table>`;
+  container.innerHTML = html;
+}
+
+function renderTriangular(triRows) {
+  const container = document.getElementById("triSnapshot");
+  if (!triRows.length) { container.innerHTML = `<div class="sub">No triangular data yet.</div>`; return; }
+  let html = `<table><thead><tr><th>Exchange</th><th>USDT→BTC→ETH→USDT</th><th>USDT→ETH→BTC→USDT</th></tr></thead><tbody>`;
+  for (const r of triRows) {
+    html += `<tr><td>${EXCHANGES[r.exId].name}</td>` +
+      `<td class="${r.edgeA > 0 ? "edge-pos" : "edge-neg"}">${(r.edgeA >= 0 ? "+" : "") + r.edgeA.toFixed(3)}%</td>` +
+      `<td class="${r.edgeB > 0 ? "edge-pos" : "edge-neg"}">${(r.edgeB >= 0 ? "+" : "") + r.edgeB.toFixed(3)}%</td></tr>`;
+  }
+  html += `</tbody></table>`;
+  container.innerHTML = html;
+}
+
+function renderLog() {
+  const body = document.getElementById("logBody");
+  body.innerHTML = opportunityLog.slice(0, 100).map(o => `
+    <tr><td>${o.ts.replace("T", " ").slice(0, 19)}</td><td>${o.type}</td><td>${o.detail}</td>
+    <td class="edge-pos">+${o.edgePct.toFixed(3)}%</td><td>${o.repeatCount}</td></tr>
+  `).join("");
+}
+
+function renderStats(startedAt) {
+  const bar = document.getElementById("statsBar");
+  const elapsedMin = ((Date.now() - startedAt) / 60000).toFixed(1);
+  const uniqueKeys = Object.keys(seenKeys).length;
+  const persistent = Object.values(seenKeys).filter(c => c >= 2).length;
+  bar.innerHTML = `
+    <div class="stat"><div class="n">${pollCount}</div><div class="l">polls run</div></div>
+    <div class="stat"><div class="n">${elapsedMin}</div><div class="l">minutes elapsed</div></div>
+    <div class="stat"><div class="n">${opportunityLog.length}</div><div class="l">opportunities logged</div></div>
+    <div class="stat"><div class="n">${uniqueKeys}</div><div class="l">unique opportunity keys</div></div>
+    <div class="stat"><div class="n">${persistent}</div><div class="l">seen 2+ consecutive polls</div></div>
+  `;
+}
+
+let startedAt = 0;
+
+async function pollOnce() {
+  pollCount++;
+  seenThisPoll.clear();
+  const jobs = [];
+  for (const exId of Object.keys(EXCHANGES)) {
+    for (const pair of PAIRS) jobs.push(pollExchangePair(exId, pair));
+  }
+  for (const exId of Object.keys(TRI_PATHS)) jobs.push(pollTriangular(exId));
+  await Promise.all(jobs);
+
+  const threshold = parseFloat(document.getElementById("threshold").value) || 0;
+  const crossRows = computeCrossEdges(threshold);
+  const triRows = computeTriangular(threshold);
+
+  renderStatus();
+  renderSnapshot(crossRows);
+  renderTriangular(triRows);
+  renderLog();
+  renderStats(startedAt);
+}
+
+function start() {
+  if (running) return;
+  running = true;
+  startedAt = Date.now();
+  document.getElementById("startBtn").disabled = true;
+  document.getElementById("stopBtn").disabled = false;
+  const interval = parseInt(document.getElementById("interval").value, 10);
+  pollOnce();
+  timer = setInterval(pollOnce, interval);
+}
+
+function stop() {
+  running = false;
+  clearInterval(timer);
+  document.getElementById("startBtn").disabled = false;
+  document.getElementById("stopBtn").disabled = true;
+}
+
+function exportLog(e) {
+  e.preventDefault();
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    pollCount,
+    fees: fees(),
+    opportunityLog,
+    note: "Detected via top-of-book comparison only. Does not account for depth/slippage, execution latency, or (for cross-exchange) fund-transfer time and price risk.",
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "arb_scan_log_" + Date.now() + ".json";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+renderFeeGrid();
+renderStatus();
+document.getElementById("startBtn").addEventListener("click", start);
+document.getElementById("stopBtn").addEventListener("click", stop);
+document.getElementById("exportLink").addEventListener("click", exportLog);
+</script>
+</body>
+</html>

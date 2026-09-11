@@ -39,6 +39,45 @@ you risk money on it. Anyone selling a subscription that a promises a
 much bigger edge with certainty is selling the same story that failed on
 GitHub a thousand times before.
 
+## Result (closed out, 2026-09-11)
+
+Ran the walk-forward backtest against real Bet365 closing odds for the
+English Premier League, 2020/21 through 2024/25 (5 seasons, 1900 matches),
+default thresholds, no tuning per-market:
+
+| Market | Bets | ROI | 95% CI (bootstrap) | Verdict |
+|---|---|---|---|---|
+| 1X2 | 779 | -7.14% | [-14.78%, +11.82%] | No edge |
+| Over/Under 2.5 | 685 | -7.83% | [-14.49%, +1.06%] | No edge |
+| Asian Handicap | 936 | -3.11% | [-8.70%, +2.88%] | No edge (closest to zero, consistent with AH's thinner margin) |
+
+**Conclusion: no market/threshold combination tested on EPL shows a
+statistically demonstrated edge against Bet365 closing lines.** This is the
+answer, not a failed attempt at one — it's exactly what efficient-market
+theory and the "no audited profitable GitHub repo exists" research (see
+above) predicted going in. AH being the least negative and having the
+tightest CI is the one data point that lines up with theory (tighter
+bookmaker margin → closer to breakeven), which is some evidence the
+methodology itself isn't broken, just that EPL specifically is too
+efficiently priced for a plain Dixon-Coles model to beat.
+
+Broader research across other sports and general quantitative/algorithmic
+trading (statistical arbitrage, crypto arbitrage, horse racing pari-mutuel
+syndicates) turned up the same structural pattern: real, durable, publicly
+documented edges are rare, and the ones that are real either decay once
+known (stat-arb went from ~0.67%/month in the 1960s-80s to unprofitable
+after costs by the 2000s as capital crowded in) or depend on a market
+structure fundamentally different from a fixed-odds bookmaker (pari-mutuel
+pools, cross-exchange price gaps). Nothing about switching sport, league, or
+domain changes that; only switching to a genuinely different market
+mechanism (e.g. arbitrage) or genuinely new information (e.g. proprietary
+data a bookmaker hasn't priced) would.
+
+Left as future work, not pursued further here: testing the same AH
+methodology on lower/thinner-liquidity leagues, and wiring in a
+non-predictive arbitrage scanner (mathematically distinct problem, not a
+statistical model at all).
+
 ## What it does
 
 1. **Data** (`src/data.py`): downloads and parses free historical

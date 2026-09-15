@@ -25,14 +25,37 @@ function fakeHttpRequest(log) {
       const body = isGet ? [] : (Array.isArray(opts.body) ? opts.body : [opts.body]);
       return { statusCode: 200, headers: {}, body };
     }
-    if (opts.url.includes('/fixtures')) {
-      if (opts.returnFullResponse) {
-        return { statusCode: 200, headers: {}, body: { data: [], pagination: { has_more: false } } };
-      }
-      return { data: [] };
+    if (opts.url.includes('/odds?bookmakers=bet365')) {
+      // realistic shape: GET /fixtures/{id}/odds?bookmakers=bet365 -> { data: { bookmakers: [...] } }
+      return {
+        statusCode: 200, headers: {}, body: { data: { bookmakers: [{ slug: 'bet365', name: 'Bet365', odds: {
+          '1x2': { closing: { home: 1.85, draw: 3.6, away: 4.2 } },
+          btts: { closing: { yes: 1.9, no: 1.9 } },
+          goal_line: { closing: { line: 2.5, over: 1.9, under: 1.9 } }
+        } }] } }
+      };
+    }
+    if (opts.url.includes('/fixtures') && opts.url.includes('status=scheduled')) {
+      return {
+        statusCode: 200, headers: {}, body: {
+          data: [{
+            id: 1, kickoff_utc: new Date(Date.now() + 3 * 3600000).toISOString(),
+            league: { id: 1, name: 'Test League', country: 'Testland' },
+            teams: { home: { id: 10, name: 'Home FC' }, away: { id: 20, name: 'Away FC' } }
+          }],
+          pagination: { has_more: false }
+        }
+      };
+    }
+    if (opts.url.includes('/fixtures/')) {
+      return { statusCode: 200, headers: {}, body: { data: { id: 1, status: 'finished', goals: { home: 2, away: 1 } } } };
     }
     if (opts.url.includes('/teams/')) {
-      return { statusCode: 200, headers: {}, body: { data: [] } };
+      return {
+        statusCode: 200, headers: {}, body: {
+          data: [{ teams: { home: { id: 10 }, away: { id: 20 } }, goals: { home: 2, away: 1 } }]
+        }
+      };
     }
     return { statusCode: 200, headers: {}, body: {} };
   };

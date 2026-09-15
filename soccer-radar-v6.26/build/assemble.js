@@ -22,9 +22,17 @@ const codeMarketScout = codeNode('Code: Market Scout v6.26', withLib(`
 ${SB}
 ${PROV}
 
-const diag = { providerRequests: 0, providerRetries: 0, providerErrors: 0, dbWrites: 0, dbWriteFailures: 0, fixturesFetched: 0, fixturesStored: 0, parseErrors: 0 };
+const diag = { providerRequests: 0, providerRetries: 0, providerErrors: 0, dbWrites: 0, dbWriteFailures: 0, fixturesFetched: 0, fixturesStored: 0, parseErrors: 0, fixturesOddsScouted: 0, fixturesSkippedCap: 0, fixturesNoBet365: 0 };
 const nowMs = Date.now();
 const window = getActiveWindow(nowMs, CONFIG);
+// Confirmed 5DollarFootballAPI PRO field shapes (from the production v6.25.4
+// engine this project has run against the real provider): fixture.teams.home/away
+// {id,name}, fixture.goals.home/away, fixture.kickoff_utc (fixture.kickoff_ts as a
+// unix-seconds fallback), fixture.league.{id,name,country} (country is a plain
+// string, not an object). The batch list's own include=odds is DISCOVERY ONLY --
+// it can carry a line with no side price -- so the authoritative price always
+// comes from a separate per-fixture GET /fixtures/{id}/odds?bookmakers=bet365 call.
+const MAX_FIXTURES_ODDS_SCOUTED_PER_RUN = 40; // provider is paced to 9/min; caps how long one Scout run can take
 
 // ---- 1. Fetch the fixture list for this window (paginated, fail-soft) --------
 async function fetchFixtureWindow() {
@@ -43,25 +51,47 @@ async function fetchFixtureWindow() {
   return out;
 }
 
-// ---- 2. Parse Bet365 odds into the canonical payload -------------------------
-// parseBet365Payload / EXCLUDED_COMPETITION_RE come from the bundled
+function fixtureKickoffIso(fx) {
+  if (fx.kickoff_utc) return fx.kickoff_utc;
+  if (Number.isFinite(Number(fx.kickoff_ts))) return new Date(Number(fx.kickoff_ts) * 1000).toISOString();
+  return null;
+}
+
+// ---- 2. Fetch the authoritative Bet365 price for ONE fixture, fail-closed ------
+// (parseBet365Payload / EXCLUDED_COMPETITION_RE come from the bundled
 // lib/bet365Parser.js above -- the SAME function the Execution Recheck node
-// uses, so the two stages can never disagree on what a field means.
+// uses, so the two stages can never disagree on what a field means.)
+async function fetchBet365Odds(fixtureId) {
+  const r = await callProvider(\`/fixtures/\${fixtureId}/odds?bookmakers=bet365\`, diag);
+  if (!r.ok) return null;
+  return r.response && r.response.data; // { bookmakers: [...] } -- exactly what parseBet365Payload expects
+}
 
 async function run() {
   const fixtures = await fetchFixtureWindow();
   diag.fixturesFetched = fixtures.length;
   const rows = [];
+  let scouted = 0;
   for (const fx of fixtures) {
     try {
       const league = fx.league || {};
-      if (EXCLUDED_COMPETITION_RE.test(String(league.name || '') + ' ' + String(fx.round || ''))) continue;
-      const bet365 = parseBet365Payload(fx);
+      const home = fx.teams && fx.teams.home;
+      const away = fx.teams && fx.teams.away;
+      if (EXCLUDED_COMPETITION_RE.test(String(league.name || ''))) continue;
+      if (!fx.id || !home || !away) continue;
+
+      if (scouted >= MAX_FIXTURES_ODDS_SCOUTED_PER_RUN) { diag.fixturesSkippedCap++; continue; }
+      scouted++;
+      const oddsPayload = await fetchBet365Odds(fx.id);
+      if (!oddsPayload) { diag.fixturesNoBet365++; continue; }
+      diag.fixturesOddsScouted++;
+
+      const bet365 = parseBet365Payload(oddsPayload);
       rows.push({
-        fixture_id: fx.id, kickoff: fx.starting_at || fx.start_time || fx.date,
-        league_id: league.id ?? null, league_name: league.name ?? null, country: (league.country && league.country.name) ?? null,
-        home_team: fx.home_team && fx.home_team.name, away_team: fx.away_team && fx.away_team.name,
-        home_team_id: fx.home_team && fx.home_team.id, away_team_id: fx.away_team && fx.away_team.id,
+        fixture_id: fx.id, kickoff: fixtureKickoffIso(fx),
+        league_id: league.id ?? null, league_name: league.name ?? null, country: league.country ?? null,
+        home_team: home.name ?? null, away_team: away.name ?? null,
+        home_team_id: home.id ?? null, away_team_id: away.id ?? null,
         bookmaker_id: 8, bookmaker_name: 'Bet365', snapshot_at: bet365.snapshotAt,
         home_odd: bet365.moneyline && bet365.moneyline.home, draw_odd: bet365.moneyline && bet365.moneyline.draw, away_odd: bet365.moneyline && bet365.moneyline.away,
         btts_yes: bet365.btts && bet365.btts.yes, btts_no: bet365.btts && bet365.btts.no,
@@ -71,8 +101,12 @@ async function run() {
     } catch (e) { diag.parseErrors++; }
   }
   if (rows.length > 0) {
-    const w = await sbWrite('/rest/v1/sr_v626_market_snapshots', 'POST', rows, diag);
-    if (w.ok) diag.fixturesStored = rows.length;
+    const validRows = rows.filter(r => r.kickoff);
+    diag.parseErrors += rows.length - validRows.length;
+    if (validRows.length > 0) {
+      const w = await sbWrite('/rest/v1/sr_v626_market_snapshots', 'POST', validRows, diag);
+      if (w.ok) diag.fixturesStored = validRows.length;
+    }
   }
   return [{ json: { windowId: window.windowId, ...diag, storedAt: new Date().toISOString() } }];
 }
@@ -122,16 +156,27 @@ function toBet365Payload(row) {
   };
 }
 
+// Confirmed real endpoint + shape (same provider fields as Market Scout):
+// GET /teams/{id}/fixtures?status=finished returns { data: [...] } where each
+// row has teams.home/away {id} and goals.home/away.
 async function fetchTeamHistory(teamId) {
-  const r = await callProvider(\`/teams/\${teamId}/results?per_page=20&order=desc\`, diag);
+  const r = await callProvider(\`/teams/\${teamId}/fixtures?status=finished&per_page=20&page=1\`, diag);
   if (!r.ok) return [];
   const rows = Array.isArray(r.response && r.response.data) ? r.response.data : [];
-  return rows.map(m => {
-    const isHome = String(m.home_team_id) === String(teamId);
-    const gf = isHome ? m.home_score : m.away_score;
-    const ga = isHome ? m.away_score : m.home_score;
-    return { goalsFor: Number(gf) || 0, goalsAgainst: Number(ga) || 0, isHome };
-  });
+  const out = [];
+  for (const m of rows) {
+    const homeId = m.teams && m.teams.home && m.teams.home.id;
+    const awayId = m.teams && m.teams.away && m.teams.away.id;
+    const isHome = String(homeId) === String(teamId);
+    const isAway = String(awayId) === String(teamId);
+    if (!isHome && !isAway) continue;
+    const gh = m.goals && m.goals.home, ga2 = m.goals && m.goals.away;
+    if (!Number.isFinite(Number(gh)) || !Number.isFinite(Number(ga2))) continue;
+    const gf = isHome ? Number(gh) : Number(ga2);
+    const ga = isHome ? Number(ga2) : Number(gh);
+    out.push({ goalsFor: gf, goalsAgainst: ga, isHome });
+  }
+  return out;
 }
 
 async function run() {
@@ -292,10 +337,13 @@ const staticData = $getWorkflowStaticData('global');
 const diag = staticData.diagnostics;
 const c = $input.first().json;
 
+// Same authoritative per-fixture endpoint Market Scout uses (NOT the batch
+// list's include=odds, which the provider only guarantees as discovery-only
+// and may carry a line with no side price).
 async function fetchLatestPrice() {
-  const r = await callProvider(\`/fixtures/\${c.fixtureId}?include=odds\`, diag);
+  const r = await callProvider(\`/fixtures/\${c.fixtureId}/odds?bookmakers=bet365\`, diag);
   if (!r.ok) return null;
-  return r.response;
+  return r.response && r.response.data;
 }
 
 async function run() {
@@ -306,7 +354,7 @@ async function run() {
   // Re-derive the exact same market/line from a FRESH parse (same
   // parseBet365Payload used by Market Scout) via the same priceLookup used at
   // selection time -- never a nearest-line, nearest-market, or stale fallback.
-  const freshBet365 = parseBet365Payload(fresh.data || fresh);
+  const freshBet365 = parseBet365Payload(fresh);
   const market = { marketFamily: c.marketFamily, side: c.side, line: c.line, bookLine: c.bookLine };
   const price = lookupPrice(freshBet365, market);
   const currentOdd = price.hasExactLine ? price.odd : c.bet365Odd;
@@ -450,9 +498,9 @@ async function fetchResult() {
 // the provider no longer exposes a pre-match Bet365 price for this market.
 async function captureClosingOddIfMissing() {
   if (p.closing_odd) return p.closing_odd;
-  const r = await callProvider(\`/fixtures/\${p.fixture_id}?include=odds\`, diag);
-  if (!r.ok || !r.response) return null;
-  const freshBet365 = parseBet365Payload(r.response.data || r.response);
+  const r = await callProvider(\`/fixtures/\${p.fixture_id}/odds?bookmakers=bet365\`, diag);
+  if (!r.ok || !r.response || !r.response.data) return null;
+  const freshBet365 = parseBet365Payload(r.response.data);
   const price = lookupPrice(freshBet365, { marketFamily: p.market_family, side: p.side, line: p.line, bookLine: p.line });
   return price.hasExactLine ? price.odd : null;
 }

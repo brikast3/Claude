@@ -17,32 +17,62 @@ const ENV = {
   SR626_TELEGRAM_CHAT_ID: '-100123456'
 };
 
+// PostgREST bulk-insert requires every row in a POSTed array to have the exact
+// same key set (one INSERT, one column list). JSON.stringify silently drops
+// any key whose value is `undefined`, so a field built with `a && a.b` (which
+// evaluates to `undefined`, not `null`, when `a` is missing) can desync one
+// row's keys from the rest and blow up in production with a cryptic "All
+// object keys must match" -- exactly what happened with real provider data.
+// Catch that class of bug here by checking every multi-row POST body.
+function assertBulkInsertKeysMatch(url, body) {
+  if (!Array.isArray(body) || body.length < 2) return;
+  const first = Object.keys(body[0]).sort().join(',');
+  for (let i = 1; i < body.length; i++) {
+    const keys = Object.keys(body[i]).sort().join(',');
+    if (keys !== first) {
+      throw new Error(`Bulk insert key mismatch for ${url}: row 0 has [${first}] but row ${i} has [${keys}]`);
+    }
+  }
+}
+
 function fakeHttpRequest(log) {
   return async (opts) => {
     log.push({ method: opts.method || 'GET', url: opts.url });
     if (opts.url.includes('/rest/v1/')) {
       const isGet = opts.method === 'GET' || !opts.method;
       const body = isGet ? [] : (Array.isArray(opts.body) ? opts.body : [opts.body]);
+      if (!isGet) assertBulkInsertKeysMatch(opts.url, JSON.parse(JSON.stringify(opts.body)));
       return { statusCode: 200, headers: {}, body };
     }
     if (opts.url.includes('/odds?bookmakers=bet365')) {
       // realistic shape: GET /fixtures/{id}/odds?bookmakers=bet365 -> { data: { bookmakers: [...] } }
-      return {
-        statusCode: 200, headers: {}, body: { data: { bookmakers: [{ slug: 'bet365', name: 'Bet365', odds: {
-          '1x2': { closing: { home: 1.85, draw: 3.6, away: 4.2 } },
-          btts: { closing: { yes: 1.9, no: 1.9 } },
-          goal_line: { closing: { line: 2.5, over: 1.9, under: 1.9 } }
-        } }] } }
-      };
+      // Fixture 2 deliberately has an incomplete book (no btts, no moneyline) --
+      // exactly the real-world case that broke the bulk insert.
+      const isFixture2 = opts.url.includes('/fixtures/2/');
+      const odds = isFixture2
+        ? { goal_line: { closing: { line: 2.5, over: 1.9, under: 1.9 } } }
+        : {
+            '1x2': { closing: { home: 1.85, draw: 3.6, away: 4.2 } },
+            btts: { closing: { yes: 1.9, no: 1.9 } },
+            goal_line: { closing: { line: 2.5, over: 1.9, under: 1.9 } }
+          };
+      return { statusCode: 200, headers: {}, body: { data: { bookmakers: [{ slug: 'bet365', name: 'Bet365', odds }] } } };
     }
     if (opts.url.includes('/fixtures') && opts.url.includes('status=scheduled')) {
       return {
         statusCode: 200, headers: {}, body: {
-          data: [{
-            id: 1, kickoff_utc: new Date(Date.now() + 3 * 3600000).toISOString(),
-            league: { id: 1, name: 'Test League', country: 'Testland' },
-            teams: { home: { id: 10, name: 'Home FC' }, away: { id: 20, name: 'Away FC' } }
-          }],
+          data: [
+            {
+              id: 1, kickoff_utc: new Date(Date.now() + 3 * 3600000).toISOString(),
+              league: { id: 1, name: 'Test League', country: 'Testland' },
+              teams: { home: { id: 10, name: 'Home FC' }, away: { id: 20, name: 'Away FC' } }
+            },
+            {
+              id: 2, kickoff_utc: new Date(Date.now() + 4 * 3600000).toISOString(),
+              league: { id: 1, name: 'Test League', country: 'Testland' },
+              teams: { home: { id: 30, name: 'Home FC 2' }, away: { id: 40, name: 'Away FC 2' } }
+            }
+          ],
           pagination: { has_more: false }
         }
       };

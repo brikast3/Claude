@@ -92,11 +92,16 @@ async function run() {
         league_id: league.id ?? null, league_name: league.name ?? null, country: league.country ?? null,
         home_team: home.name ?? null, away_team: away.name ?? null,
         home_team_id: home.id ?? null, away_team_id: away.id ?? null,
-        bookmaker_id: 8, bookmaker_name: 'Bet365', snapshot_at: bet365.snapshotAt,
-        home_odd: bet365.moneyline && bet365.moneyline.home, draw_odd: bet365.moneyline && bet365.moneyline.draw, away_odd: bet365.moneyline && bet365.moneyline.away,
-        btts_yes: bet365.btts && bet365.btts.yes, btts_no: bet365.btts && bet365.btts.no,
-        totals: bet365.totals || null, asian_totals: bet365.asianTotals || null, asian_handicap: bet365.asianHandicap || null, double_chance: bet365.doubleChance || null,
-        raw_market_payload: fx, payload_hash: null, window_id: window.windowId
+        bookmaker_id: 8, bookmaker_name: 'Bet365', snapshot_at: bet365.snapshotAt ?? null,
+        // PostgREST bulk-insert requires every row in the array to have the exact
+        // same set of keys (it builds one INSERT with one column list for all
+        // rows) -- JSON.stringify silently DROPS any key whose value is
+        // undefined, so every field below is explicitly ?? null, never left to
+        // an implicit undefined from a missing bet365.moneyline/btts/etc.
+        home_odd: bet365.moneyline?.home ?? null, draw_odd: bet365.moneyline?.draw ?? null, away_odd: bet365.moneyline?.away ?? null,
+        btts_yes: bet365.btts?.yes ?? null, btts_no: bet365.btts?.no ?? null,
+        totals: bet365.totals ?? null, asian_totals: bet365.asianTotals ?? null, asian_handicap: bet365.asianHandicap ?? null, double_chance: bet365.doubleChance ?? null,
+        raw_market_payload: fx ?? null, payload_hash: null, window_id: window.windowId ?? null
       });
     } catch (e) { diag.parseErrors++; }
   }

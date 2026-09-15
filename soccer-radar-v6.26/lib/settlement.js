@@ -5,11 +5,18 @@
 
 // splitLine/settleBaseOutcome come from lib/math.js. When bundled into a single
 // n8n Code node, math.js is concatenated in ahead of this file so these names
-// are already in scope; under Node (tests, build script) we require them.
+// are already real function declarations in scope; under Node (tests, build
+// script) we require them instead. IMPORTANT: some sandboxes (including
+// self-hosted n8n's task runner) define a `require` that THROWS on any
+// disallowed module rather than being `undefined` -- so the require() call
+// itself must only ever run when the names are not already defined, never
+// merely gated on `typeof require`.
 /* eslint-disable no-var */
-var __math = typeof require !== 'undefined' ? require('./math') : null;
-var splitLine = typeof splitLine !== 'undefined' ? splitLine : __math.splitLine;
-var settleBaseOutcome = typeof settleBaseOutcome !== 'undefined' ? settleBaseOutcome : __math.settleBaseOutcome;
+if (typeof splitLine === 'undefined' || typeof settleBaseOutcome === 'undefined') {
+  var __math = require('./math');
+  var splitLine = __math.splitLine;
+  var settleBaseOutcome = __math.settleBaseOutcome;
+}
 
 const EPS = 1e-6;
 

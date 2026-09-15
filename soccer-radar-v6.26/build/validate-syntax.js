@@ -19,4 +19,24 @@ for (const n of wf.nodes) {
   }
 }
 console.log(`Code nodes syntax-checked: ${ok} ok, ${fail} failed (of ${wf.nodes.filter(n => n.type === 'n8n-nodes-base.code').length} total)`);
+
+// Regression guard: self-hosted n8n's task-runner sandbox defines `require`
+// as a function that THROWS "Module 'X' is disallowed" rather than leaving it
+// undefined. Any lib file that gates a require() call on `typeof require !==
+// 'undefined'` alone (instead of also checking the target is not already
+// defined) will crash in production even though it passes locally. Load the
+// bundle under a require() that always throws to catch this class of bug.
+const vm = require('vm');
+const { bundleLib } = require('./bundle');
+const src = bundleLib();
+const fakeSandbox = { require: (m) => { throw new Error(`Module '${m}' is disallowed`); } };
+vm.createContext(fakeSandbox);
+try {
+  vm.runInContext(src, fakeSandbox);
+  console.log('Bundle loads cleanly under a throwing require() (matches self-hosted n8n sandbox behavior).');
+} catch (e) {
+  console.error('BUNDLE FAILS under a throwing require():', e.message);
+  fail++;
+}
+
 if (fail > 0) process.exit(1);

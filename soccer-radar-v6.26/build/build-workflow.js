@@ -105,7 +105,15 @@ function supabaseHeaders() {
     "const sbFetch = (pathAndQuery, opts) => this.helpers.httpRequest({ url: SUPABASE_URL + pathAndQuery, headers: SB_HEADERS, json: true, timeout: 20000, ...(opts || {}) });",
     "const sbWrite = async (pathAndQuery, method, body, diag) => {",
     "  const r = await httpWithRetry((attempt) => sbFetch(pathAndQuery, { method, body, headers: { ...SB_HEADERS, Prefer: 'return=representation,resolution=merge-duplicates' } }), CONFIG, {});",
-    "  if (diag) { diag.dbWrites++; if (!r.ok) diag.dbWriteFailures++; }",
+    "  if (diag) {",
+    "    diag.dbWrites++;",
+    "    if (!r.ok) {",
+    "      diag.dbWriteFailures++;",
+    "      // Surfaced so a failed run is diagnosable from the node's own output JSON",
+    "      // instead of digging through n8n's internal HTTP logs.",
+    "      diag.lastDbError = { path: pathAndQuery, status: r.status, message: r.message };",
+    "    }",
+    "  }",
     "  return r;",
     "};"
   ].join('\n') + '\n';
@@ -135,7 +143,11 @@ function providerHeaders() {
     "    if (status >= 400) { const e = new Error('provider ' + status); e.statusCode = status; e.retryAfterSeconds = Number(resp && resp.headers && resp.headers['retry-after']); throw e; }",
     "    return resp && resp.body;",
     "  }, CONFIG, {});",
-    "  if (diag) { diag.providerRequests += r.attempts.made; diag.providerRetries += r.attempts.retries; if (!r.ok) diag.providerErrors++; }",
+    "  if (diag) {",
+    "    diag.providerRequests += r.attempts.made;",
+    "    diag.providerRetries += r.attempts.retries;",
+    "    if (!r.ok) { diag.providerErrors++; diag.lastProviderError = { path: pathAndQuery, status: r.status, message: r.message }; }",
+    "  }",
     "  return r;",
     "};"
   ].join('\n') + '\n';

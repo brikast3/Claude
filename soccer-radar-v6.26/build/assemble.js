@@ -22,7 +22,7 @@ const codeMarketScout = codeNode('Code: Market Scout v6.26', withLib(`
 ${SB}
 ${PROV}
 
-const diag = { providerRequests: 0, providerRetries: 0, providerErrors: 0, dbWrites: 0, dbWriteFailures: 0, fixturesFetched: 0, fixturesStored: 0 };
+const diag = { providerRequests: 0, providerRetries: 0, providerErrors: 0, dbWrites: 0, dbWriteFailures: 0, fixturesFetched: 0, fixturesStored: 0, parseErrors: 0 };
 const nowMs = Date.now();
 const window = getActiveWindow(nowMs, CONFIG);
 
@@ -68,7 +68,7 @@ async function run() {
         totals: bet365.totals || null, asian_totals: bet365.asianTotals || null, asian_handicap: bet365.asianHandicap || null, double_chance: bet365.doubleChance || null,
         raw_market_payload: fx, payload_hash: null, window_id: window.windowId
       });
-    } catch (e) { diag.dbWriteFailures++; }
+    } catch (e) { diag.parseErrors++; }
   }
   if (rows.length > 0) {
     const w = await sbWrite('/rest/v1/sr_v626_market_snapshots', 'POST', rows, diag);

@@ -21,8 +21,9 @@ function fakeHttpRequest(log) {
   return async (opts) => {
     log.push({ method: opts.method || 'GET', url: opts.url });
     if (opts.url.includes('/rest/v1/')) {
-      if (opts.method === 'GET' || !opts.method) return [];
-      return Array.isArray(opts.body) ? opts.body : [opts.body];
+      const isGet = opts.method === 'GET' || !opts.method;
+      const body = isGet ? [] : (Array.isArray(opts.body) ? opts.body : [opts.body]);
+      return { statusCode: 200, headers: {}, body };
     }
     if (opts.url.includes('/fixtures')) {
       if (opts.returnFullResponse) {

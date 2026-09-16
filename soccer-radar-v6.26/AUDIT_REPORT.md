@@ -232,3 +232,60 @@ At the configured pacing, even a worst-case burst of ~40 calls in one Selector r
 **Required n8n setup before activating:** environment variables `SUPABASE_URL`,
 `SUPABASE_SERVICE_KEY`, `SR626_PROVIDER_API_BASE`, `SR626_PROVIDER_API_KEY`,
 `SR626_TELEGRAM_CHAT_ID`, and a Telegram API credential named "Telegram account".
+
+## 11. v6.26.1 addendum — fixes from real-provider testing
+
+Found and fixed after the account owner ran this workflow against the real provider and a
+real Supabase project (three real bugs the mocked smoke tests could not have caught, since
+they don't enforce Postgres constraints or exercise real provider field shapes):
+
+1. **`sr_v626_runs` parent created before children.** The original design inserted the run
+   row only at the very end (`Save Run Diagnostics`), but `sr_v626_fixture_analysis` and
+   `sr_v626_market_candidates` both have a foreign key to it — every child write during a
+   run would have violated that FK. `Code: Load Fixtures From Snapshots` now creates the
+   parent (`status: RUNNING`) first; `Save Run Diagnostics` `PATCH`es that same row instead
+   of inserting a second one. `run_id` is now always freshly generated (removed a `||`
+   that could otherwise reuse a stale id left in global static data from a prior
+   execution — this closes Known Limitation #3 above).
+2. **Real 5DollarFootballAPI field names.** Several guessed field names were wrong:
+   kickoff is `fixture.kickoff_utc` / `kickoff_ts` (not `starting_at`), teams are
+   `fixture.teams.home/away.{id,name}` (not `fixture.home_team`), `league.country` is a
+   plain string. The batch fixture list's `include=odds` is discovery-only per the
+   provider (may carry a line with no side price) — the authoritative price always
+   requires a separate `GET /fixtures/{id}/odds?bookmakers=bet365` call, now used
+   everywhere a price is read (Market Scout, Execution Recheck, closing-line capture).
+3. **PostgREST bulk-insert key consistency.** A field built as `a && a.b` evaluates to
+   `undefined` (not `null`) when `a` is missing, and `JSON.stringify` drops
+   `undefined`-valued keys — so a fixture with an incomplete Bet365 book produced a
+   snapshot row with a different key set than its neighbors, and PostgREST rejects a
+   multi-row insert unless every row has the exact same columns ("All object keys must
+   match"). Every field is now explicit `?? null`, and `build/smoke-test.js` permanently
+   guards against this class of bug (`assertBulkInsertKeysMatch`, JSON round-trips every
+   multi-row POST body exactly as production would).
+
+Two further improvements, ported from a corrected copy of this workflow the account owner
+produced independently and verified against here before merging:
+
+4. **Real-market-only universe.** `buildMarketUniverse(config, bet365)` now builds
+   candidates only from lines Bet365 actually quoted for the fixture, rather than the full
+   theoretical 49-market grid filtered down after the fact. Confirmed via `AUDIT_REPORT.md`
+   §5 limitation #2 (real books are sparse) — this avoids ~40 empty
+   `EXACT_MARKET_NOT_FOUND` rows per fixture in the common case.
+5. **Execution Recheck fully recomputes**, not just re-checks price deterioration:
+   de-vig → calibration → EV → Edge → MarketScore are all re-derived from the live price
+   (`lib/executionRecheck.js`, unit-tested), so a price move that would change the
+   calibrated verdict is judged on the new verdict, not the stale selection-time one.
+   Asian Handicap candidates are now labelled `MARKET_FAMILY_RESEARCH_ONLY` instead of a
+   bare `null` (added to the SQL `rejection_reason` CHECK constraint — additive, verified
+   against a live PostgreSQL instance).
+
+**Rejected from that independently-produced copy:** its sticky-note documentation claimed
+"no artificial per-run or per-day publication quantity cap" (relabeled
+`v6.26.6 · 5-WINDOW QUALITY-UNLIMITED`), but the actual `Finalize Candidate Queue` code was
+byte-for-byte unchanged and still enforces `CONFIG.volume.maxPublicPerRun=2` /
+`maxPublicPerDay=4` — the documentation didn't match the code. This workflow keeps those
+caps enforced and does not claim otherwise anywhere.
+
+All 240 tests pass (up from 227), `build/validate-syntax.js` and `build/smoke-test.js` are
+clean, and the SQL schema + reset scripts were re-verified against a live PostgreSQL 16
+instance after the `MARKET_FAMILY_RESEARCH_ONLY` addition.

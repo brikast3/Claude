@@ -5,7 +5,7 @@
 // n8n Code node that needs it, and imported directly by the test suite, so the
 // logic under test is byte-for-byte the logic that runs in production.
 
-const ENGINE_VERSION = 'V6.26';
+const ENGINE_VERSION = 'V6.26.1'; // .1: run-lifecycle FK fix, real-market-only universe, full execution-time recompute
 const MODEL_VERSION = 'MULTI_MARKET_SELECTOR_V1';
 const CALIBRATION_VERSION = 'V626_CALIBRATION_V1';
 const SCORE_VERSION = 'MARKET_SCORE_V1';
@@ -33,6 +33,12 @@ const REJECTION_REASONS = Object.freeze({
   MODEL_PROBABILITY_INVALID: 'MODEL_PROBABILITY_INVALID',
   MARKET_PROBABILITY_INVALID: 'MARKET_PROBABILITY_INVALID',
   EXECUTION_REJECTED: 'EXECUTION_REJECTED',
+  // Not a gate failure -- marks an Asian Handicap candidate that was never a
+  // public-gate participant in the first place (AH is research-only while
+  // config.markets.asianHandicapPublicEnabled=false). Distinct from a null
+  // rejection_reason so a reader never has to guess "was this actually
+  // evaluated for publication or not".
+  MARKET_FAMILY_RESEARCH_ONLY: 'MARKET_FAMILY_RESEARCH_ONLY',
   UNEXPECTED_ERROR: 'UNEXPECTED_ERROR' // only for genuinely unforeseen exceptions
 });
 

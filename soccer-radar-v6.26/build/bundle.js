@@ -8,7 +8,7 @@ const LIB_DIR = path.join(__dirname, '..', 'lib');
 const ORDER = [
   'config.js', 'schedule.js', 'math.js', 'fixtureProfile.js', 'devig.js', 'calibration.js',
   'scoring.js', 'gate.js', 'selection.js', 'marketUniverse.js', 'priceLookup.js', 'bet365Parser.js',
-  'engine.js', 'settlement.js', 'rateLimiter.js', 'telegram.js', 'diagnostics.js'
+  'engine.js', 'executionRecheck.js', 'settlement.js', 'rateLimiter.js', 'telegram.js', 'diagnostics.js'
 ];
 
 function bundleLib(files = ORDER) {

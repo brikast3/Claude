@@ -43,7 +43,8 @@ function buildCandidate(market, ctx, config) {
     historyScore: fixtureProfile.historyScore,
     homeSampleN: fixtureProfile.home.sampleN,
     awaySampleN: fixtureProfile.away.sampleN,
-    insufficientHistory: fixtureProfile.insufficientHistory
+    insufficientHistory: fixtureProfile.insufficientHistory,
+    leagueReliabilityScore: leagueReliabilityScore ?? 50
   };
 
   if (!price.hasExactLine) {
@@ -167,13 +168,13 @@ function evaluateFixture(fixtureInput, config) {
     leagueReliabilityScore: fixtureInput.leagueReliabilityScore
   };
 
-  const universe = buildMarketUniverse(config);
+  const universe = buildMarketUniverse(config, fixtureInput.bet365);
   let candidates = universe.map(market => buildCandidate(market, ctx, config));
 
   // Own-candidate gate: applied to every public-enabled-family candidate (AH is
   // excluded -- it is never a public gate candidate while disabled).
   for (const c of candidates) {
-    if (!c.publicEligible) { c.rejectionReason = null; continue; }
+    if (!c.publicEligible) { c.rejectionReason = config.rejectionReasons.MARKET_FAMILY_RESEARCH_ONLY; continue; }
     const verdict = evaluateCandidateGate(c, config);
     c.rejectionReason = verdict.passed ? null : verdict.reasonCode;
   }

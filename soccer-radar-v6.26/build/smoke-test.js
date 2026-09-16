@@ -4,7 +4,8 @@
 // code before this ever touches a real n8n instance.
 const fs = require('fs');
 const path = require('path');
-const wf = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'out', 'SOCCER_RADAR_v6.26_QUALITY_FIRST_MULTI_MARKET_SELECTOR_FINAL.json'), 'utf8'));
+const TARGET = process.argv[2] || path.join(__dirname, '..', 'out', 'SOCCER_RADAR_v6.26_QUALITY_FIRST_MULTI_MARKET_SELECTOR_FINAL.json');
+const wf = JSON.parse(fs.readFileSync(TARGET, 'utf8'));
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
 function codeOf(name) {

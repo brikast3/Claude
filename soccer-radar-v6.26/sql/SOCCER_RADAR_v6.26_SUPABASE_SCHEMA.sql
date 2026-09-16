@@ -142,7 +142,7 @@ create table if not exists sr_v626_market_candidates (
                                        'BET365_PRICE_MOVED','PRICE_DETERIORATION_TOO_HIGH','SNAPSHOT_STALE',
                                        'FIXTURE_ALREADY_PUBLISHED','DAILY_CAP_REACHED','RUN_CAP_REACHED',
                                        'INSUFFICIENT_HISTORY','MODEL_PROBABILITY_INVALID','MARKET_PROBABILITY_INVALID',
-                                       'EXECUTION_REJECTED','UNEXPECTED_ERROR'
+                                       'EXECUTION_REJECTED','MARKET_FAMILY_RESEARCH_ONLY','UNEXPECTED_ERROR'
                                      )),
 
   market_snapshot_at               timestamptz,

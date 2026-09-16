@@ -19,6 +19,7 @@ const priceLookup = require('../lib/priceLookup');
 const engine = require('../lib/engine');
 const schedule = require('../lib/schedule');
 const bet365Parser = require('../lib/bet365Parser');
+const executionRecheck = require('../lib/executionRecheck');
 
 let passCount = 0, failCount = 0;
 const failures = [];
@@ -794,16 +795,51 @@ test('recordRejection tallies counts per reason code', () => {
 // ---------------------------------------------------------------------------
 // SECTION 18 · MARKET UNIVERSE / PRICE LOOKUP (fail-closed, no fallback)
 // ---------------------------------------------------------------------------
-test('Market universe contains exactly 49 markets (16+2+3+2+26)', () => {
-  assert.strictEqual(marketUniverse.buildMarketUniverse(CONFIG).length, 49);
+function fullBet365Payload() {
+  const totals = {}, asianTotals = {};
+  for (const line of CONFIG.markets.goalsLines) {
+    const table = marketUniverse.isStandardGoalsLine(line) ? totals : asianTotals;
+    table[String(line)] = { over: 1.9, under: 1.9 };
+  }
+  const asianHandicap = {};
+  for (const line of CONFIG.markets.asianHandicapLines) asianHandicap[String(line)] = { home: 1.9, away: 1.95 };
+  return {
+    moneyline: { home: 1.9, draw: 3.5, away: 4.0 },
+    btts: { yes: 1.9, no: 1.9 },
+    doubleChance: { oneX: 1.25, xTwo: 1.6 },
+    totals, asianTotals, asianHandicap
+  };
+}
+// Universe built from a fully-priced book proves the enumeration logic itself
+// (every line, both sides, correct key naming) is complete and correct.
+test('Market universe contains exactly 49 markets when every line is priced (16+2+3+2+26)', () => {
+  assert.strictEqual(marketUniverse.buildMarketUniverse(CONFIG, fullBet365Payload()).length, 49);
 });
-test('Market universe covers all 8 goals lines x 2 sides', () => {
-  const goals = marketUniverse.buildMarketUniverse(CONFIG).filter(m => m.marketFamily === 'GOALS');
+test('Market universe covers all 8 goals lines x 2 sides when fully priced', () => {
+  const goals = marketUniverse.buildMarketUniverse(CONFIG, fullBet365Payload()).filter(m => m.marketFamily === 'GOALS');
   assert.strictEqual(goals.length, 16);
 });
-test('Market universe covers all 13 Asian Handicap lines x 2 sides', () => {
-  const ah = marketUniverse.buildMarketUniverse(CONFIG).filter(m => m.marketFamily === 'ASIAN_HANDICAP');
+test('Market universe covers all 13 Asian Handicap lines x 2 sides when fully priced', () => {
+  const ah = marketUniverse.buildMarketUniverse(CONFIG, fullBet365Payload()).filter(m => m.marketFamily === 'ASIAN_HANDICAP');
   assert.strictEqual(ah.length, 26);
+});
+// Real Bet365 books are sparse (spec limitation #2) -- the universe must
+// shrink to exactly what was quoted, never pad with synthetic/theoretical markets.
+test('Market universe with no bet365 payload at all is empty (fail closed, never synthetic)', () => {
+  assert.strictEqual(marketUniverse.buildMarketUniverse(CONFIG, undefined).length, 0);
+  assert.strictEqual(marketUniverse.buildMarketUniverse(CONFIG, {}).length, 0);
+});
+test('Market universe with a sparse real-world book only includes quoted sides', () => {
+  const sparse = { btts: { yes: 1.9, no: 1.9 }, totals: { '2.5': { over: 1.85, under: undefined } } };
+  const universe = marketUniverse.buildMarketUniverse(CONFIG, sparse);
+  assert.strictEqual(universe.length, 3); // BTTS_YES, BTTS_NO, OVER_2_5 (no UNDER_2_5: no price)
+  assert.ok(!universe.some(m => m.marketKey === 'UNDER_2_5'));
+  assert.ok(!universe.some(m => m.marketFamily === 'ASIAN_HANDICAP'));
+});
+test('Market universe never includes a side priced at exactly 1 (no edge, not a real bet)', () => {
+  const universe = marketUniverse.buildMarketUniverse(CONFIG, { btts: { yes: 1, no: 1.9 } });
+  assert.strictEqual(universe.length, 1);
+  assert.strictEqual(universe[0].marketKey, 'BTTS_NO');
 });
 test('Asian Handicap is excluded from public-enabled families', () => {
   assert.ok(!CONFIG.markets.publicEnabledFamilies.includes('ASIAN_HANDICAP'));
@@ -867,7 +903,7 @@ test('Three non-overlapping schedule windows are configured', () => {
   assert.deepStrictEqual(ids, ['A', 'B', 'C']);
 });
 test('Version tags match spec exactly', () => {
-  assert.strictEqual(CONFIG.engineVersion, 'V6.26');
+  assert.strictEqual(CONFIG.engineVersion, 'V6.26.1');
   assert.strictEqual(CONFIG.modelVersion, 'MULTI_MARKET_SELECTOR_V1');
   assert.strictEqual(CONFIG.calibrationVersion, 'V626_CALIBRATION_V1');
   assert.strictEqual(CONFIG.scoreVersion, 'MARKET_SCORE_V1');
@@ -893,7 +929,9 @@ test('Engine end-to-end: a clean high-quality fixture can produce a public best 
     snapshotAt: new Date(Date.now() - 5 * 60000).toISOString(),
     nowMs: Date.now()
   }, CONFIG);
-  assert.strictEqual(result.candidates.length, 49);
+  // Real-world sparse book: moneyline(3) + btts(2) + totals 2.5(2) + doubleChance(2) = 9.
+  // No theoretical 49-market padding for lines/markets Bet365 never quoted.
+  assert.strictEqual(result.candidates.length, 9);
   assert.ok(result.lambdaHome > 0 && result.lambdaAway > 0);
 });
 
@@ -919,7 +957,8 @@ test('Engine end-to-end: a fixture with prices on no markets at all produces zer
     bet365: {}, snapshotAt: new Date().toISOString(), nowMs: Date.now()
   }, CONFIG);
   assert.strictEqual(result.bestCandidate, null);
-  assert.ok(result.candidates.every(c => c.hasExactMarket === false));
+  // An empty book means an empty universe -- no theoretical placeholders.
+  assert.strictEqual(result.candidates.length, 0);
 });
 
 test('Engine end-to-end: Asian Handicap candidates are fully scored even though never public', () => {
@@ -932,7 +971,11 @@ test('Engine end-to-end: Asian Handicap candidates are fully scored even though 
   const ah = result.candidates.find(c => c.marketKey.startsWith('AH_HOME'));
   assert.ok(ah.marketScore >= 0);
   assert.strictEqual(ah.publicEligible, false);
+  assert.strictEqual(ah.rejectionReason, R.MARKET_FAMILY_RESEARCH_ONLY);
   assert.strictEqual(result.bestCandidate, null);
+});
+test('MARKET_FAMILY_RESEARCH_ONLY is a valid reason code (never a schema-rejected ad-hoc string)', () => {
+  assert.strictEqual(diagnostics.validateReasonCode(R.MARKET_FAMILY_RESEARCH_ONLY, CONFIG), true);
 });
 
 // ---------------------------------------------------------------------------
@@ -1018,6 +1061,73 @@ test('EXCLUDED_COMPETITION_RE matches friendlies and youth competitions', () => 
   assert.ok(bet365Parser.EXCLUDED_COMPETITION_RE.test('International Friendly'));
   assert.ok(bet365Parser.EXCLUDED_COMPETITION_RE.test('U19 Championship'));
   assert.ok(!bet365Parser.EXCLUDED_COMPETITION_RE.test('LaLiga'));
+});
+
+// ---------------------------------------------------------------------------
+// SECTION 23 · EXECUTION-TIME RECOMPUTE (spec S19 -- not just deterioration)
+// ---------------------------------------------------------------------------
+function stagedCandidate(overrides) {
+  return Object.assign({
+    fixtureId: 1, marketFamily: 'BTTS', marketKey: 'BTTS_YES', side: 'YES', line: null, bookLine: null,
+    bet365Odd: 1.90, modelProbabilityRaw: 0.58,
+    homeSampleN: 15, awaySampleN: 15, historyScore: 85, dataQualityScore: 90, leagueReliabilityScore: 85,
+    marketScore: 75, calibratedEv: 0.05, calibratedEdgePp: 0.03
+  }, overrides || {});
+}
+test('Execution recompute: unchanged price re-derives essentially the same verdict and approves', () => {
+  const r = executionRecheck.recomputeExecutionCandidate(stagedCandidate(), { btts: { yes: 1.90, no: 1.90 } }, CONFIG);
+  assert.strictEqual(r.approved, true);
+  assert.strictEqual(r.currentOdd, 1.90);
+  assert.ok(r.refreshed.modelProbabilityCalibrated > 0);
+});
+test('Execution recompute: price deteriorated beyond 2% is rejected on the RECOMPUTED numbers', () => {
+  const r = executionRecheck.recomputeExecutionCandidate(stagedCandidate(), { btts: { yes: 1.83, no: 1.97 } }, CONFIG);
+  assert.strictEqual(r.approved, false);
+  assert.strictEqual(r.reasonCode, R.PRICE_DETERIORATION_TOO_HIGH);
+});
+test('Execution recompute: price improved is still approved (never auto-rejected for being better)', () => {
+  const r = executionRecheck.recomputeExecutionCandidate(stagedCandidate(), { btts: { yes: 2.0, no: 1.8 } }, CONFIG);
+  assert.strictEqual(r.approved, true);
+  assert.strictEqual(r.currentOdd, 2.0);
+});
+test('Execution recompute: market vanished entirely -> EXACT_MARKET_NOT_FOUND, never a fallback', () => {
+  const r = executionRecheck.recomputeExecutionCandidate(stagedCandidate(), {}, CONFIG);
+  assert.strictEqual(r.approved, false);
+  assert.strictEqual(r.reasonCode, R.EXACT_MARKET_NOT_FOUND);
+});
+test('Execution recompute: exact line vanished (family present) -> EXACT_LINE_NOT_FOUND', () => {
+  const c = stagedCandidate({ marketFamily: 'GOALS', marketKey: 'OVER_2_5', side: 'OVER', line: 2.5 });
+  const r = executionRecheck.recomputeExecutionCandidate(c, { totals: { '3.5': { over: 1.9, under: 1.9 } } }, CONFIG);
+  assert.strictEqual(r.approved, false);
+  assert.strictEqual(r.reasonCode, R.EXACT_LINE_NOT_FOUND);
+});
+test('Execution recompute judges the fresh price on its OWN merits, not the stale staged marketScore', () => {
+  // Same staged candidate (marketScore=75 at selection time), but the fresh
+  // price implies a market probability that wildly disagrees with the model --
+  // the recompute must fail on that new disagreement, regardless of what the
+  // candidate looked like when it was first selected.
+  const c = stagedCandidate({ modelProbabilityRaw: 0.85 }); // model very confident of YES
+  const agreeing = executionRecheck.recomputeExecutionCandidate(c, { btts: { yes: 1.30, no: 3.2 } }, CONFIG); // market agrees (low odd = high implied prob)
+  const disagreeing = executionRecheck.recomputeExecutionCandidate(c, { btts: { yes: 1.90, no: 1.90 } }, CONFIG); // market thinks ~50/50
+  assert.ok(agreeing.refreshed.marketScore > disagreeing.refreshed.marketScore,
+    `agreeing score ${agreeing.refreshed.marketScore} should exceed disagreeing score ${disagreeing.refreshed.marketScore}`);
+});
+test('Execution recompute: MONEYLINE uses three-way de-vig for the market probability', () => {
+  const c = stagedCandidate({ marketFamily: 'MONEYLINE', marketKey: 'HOME_WIN', side: 'HOME_WIN', modelProbabilityRaw: 0.5 });
+  const r = executionRecheck.recomputeExecutionCandidate(c, { moneyline: { home: 1.90, draw: 3.6, away: 4.2 } }, CONFIG);
+  assert.ok(r.refreshed.devigMarketProbability > 0 && r.refreshed.devigMarketProbability < 1);
+});
+test('Execution recompute: invalid staged model probability fails closed', () => {
+  const c = stagedCandidate({ modelProbabilityRaw: NaN });
+  const r = executionRecheck.recomputeExecutionCandidate(c, { btts: { yes: 1.9, no: 1.9 } }, CONFIG);
+  assert.strictEqual(r.refreshed.modelProbabilityValid, false);
+  assert.strictEqual(r.refreshed.modelProbabilityCalibrated, null);
+});
+test('Execution recompute snapshot age reflects the FRESH fetch, not the stale selection-time snapshot', () => {
+  const oldSnapshot = new Date(Date.now() - 90 * 60000).toISOString();
+  const c = stagedCandidate({ marketSnapshotAt: oldSnapshot });
+  const r = executionRecheck.recomputeExecutionCandidate(c, { btts: { yes: 1.9, no: 1.9, }, snapshotAt: new Date().toISOString() }, CONFIG);
+  assert.ok(r.approved, 'must not fail SNAPSHOT_STALE using the old selection-time timestamp');
 });
 
 // ---------------------------------------------------------------------------

@@ -132,7 +132,11 @@ const codeLoadFixtures = codeNode('Code: Load Fixtures From Snapshots', withLib(
 ${SB}
 ${PROV}
 const staticData = $getWorkflowStaticData('global');
-staticData.runId = staticData.runId || (Date.now().toString(36) + Math.random().toString(36).slice(2, 8));
+// A Selector execution MUST own a fresh run id -- reusing one across
+// executions would break the FK lifecycle below and mix diagnostics between
+// unrelated runs (global static data persists across executions, not just
+// within one, so this can never be a lazy \`||\`).
+staticData.runId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 staticData.diagnostics = createRunDiagnostics();
 staticData.stagedCandidates = [];
 staticData.runStartedAt = new Date().toISOString();
@@ -140,6 +144,23 @@ staticData.runStartedAt = new Date().toISOString();
 const nowMs = Date.now();
 const window = getActiveWindow(nowMs, CONFIG);
 const diag = staticData.diagnostics;
+
+// sr_v626_fixture_analysis / sr_v626_market_candidates both have a FK to
+// sr_v626_runs(run_id) -- the parent row must exist BEFORE any child write,
+// so it is created here, first, with status=RUNNING. Save Run Diagnostics
+// (end of run) PATCHes this same row rather than inserting a second one.
+async function createSelectorRunParent() {
+  const row = {
+    run_id: staticData.runId, started_at: staticData.runStartedAt, finished_at: null, window: window.windowId,
+    fixtures_fetched: 0, fixtures_analyzed: 0, fixture_profiles_built: 0, markets_evaluated: 0,
+    candidates_passing_model: 0, candidates_passing_price: 0, candidates_passing_calibration: 0, candidates_passing_market_score: 0,
+    public_candidates: 0, published_count: 0, execution_rejected: 0,
+    provider_requests: 0, provider_retries: 0, provider_errors: 0,
+    status: 'RUNNING', diagnostics: diag
+  };
+  const r = await sbWrite('/rest/v1/sr_v626_runs', 'POST', [row], diag);
+  if (!r.ok) throw new Error('RUN_PARENT_CREATE_FAILED status=' + (r.status || 0) + ' message=' + (r.message || 'UNKNOWN_DB_ERROR'));
+}
 
 async function loadLatestSnapshots() {
   const startIso = new Date(window.rangeStartMs).toISOString();
@@ -185,6 +206,9 @@ async function fetchTeamHistory(teamId) {
 }
 
 async function run() {
+  // Parent first, children second. If this fails, the Selector stops before
+  // any fixture_analysis / market_candidates write can violate the FK.
+  await createSelectorRunParent();
   const snapshotRows = await loadLatestSnapshots();
   const byFixture = new Map();
   for (const row of snapshotRows) if (!byFixture.has(row.fixture_id)) byFixture.set(row.fixture_id, row);
@@ -357,27 +381,32 @@ async function run() {
     return [{ json: { ...c, executionApproved: false, executionReason: CONFIG.rejectionReasons.EXACT_MARKET_NOT_FOUND } }];
   }
   // Re-derive the exact same market/line from a FRESH parse (same
-  // parseBet365Payload used by Market Scout) via the same priceLookup used at
-  // selection time -- never a nearest-line, nearest-market, or stale fallback.
+  // parseBet365Payload used by Market Scout), then fully recompute de-vig ->
+  // calibration -> EV/Edge -> MarketScore -> gate against the CURRENT price --
+  // never a nearest-line, nearest-market, or stale fallback, and never a gate
+  // check against stale selection-time numbers.
   const freshBet365 = parseBet365Payload(fresh);
-  const market = { marketFamily: c.marketFamily, side: c.side, line: c.line, bookLine: c.bookLine };
-  const price = lookupPrice(freshBet365, market);
-  const currentOdd = price.hasExactLine ? price.odd : c.bet365Odd;
-  const priceDeteriorationPct = c.bet365Odd > 0 ? Math.max(0, (c.bet365Odd - currentOdd) / c.bet365Odd) : 1;
-  const snapshotAgeMinutes = (Date.now() - Date.parse(c.marketSnapshotAt)) / 60000;
+  const result = recomputeExecutionCandidate(c, freshBet365, CONFIG);
 
-  const verdict = evaluateExecutionRecheck({
-    ...c, odd: currentOdd, entryOdd: c.bet365Odd, hasExactMarket: price.hasExactMarket === true,
-    hasExactLine: price.hasExactLine === true, snapshotAgeMinutes
-  }, priceDeteriorationPct, CONFIG);
-
-  if (!verdict.passed) {
+  if (!result.approved) {
     diag.executionRejected++;
-    recordRejection(diag, verdict.reasonCode);
-    await sbWrite(\`/rest/v1/sr_v626_market_candidates?fixture_id=eq.\${c.fixtureId}&market_key=eq.\${c.marketKey}&run_id=eq.\${staticData.runId}\`, 'PATCH', { rejection_reason: verdict.reasonCode, selected_as_best_market: false }, diag);
-    return [{ json: { ...c, executionApproved: false, executionReason: verdict.reasonCode } }];
+    recordRejection(diag, result.reasonCode);
+    const patch = { rejection_reason: result.reasonCode, selected_as_best_market: false };
+    if (result.refreshed) {
+      Object.assign(patch, {
+        bet365_odd: result.currentOdd, devig_market_probability: result.refreshed.devigMarketProbability,
+        model_probability_calibrated: result.refreshed.modelProbabilityCalibrated, calibrated_ev: result.refreshed.calibratedEv,
+        calibrated_edge_pp: result.refreshed.calibratedEdgePp, market_score: result.refreshed.marketScore,
+        market_snapshot_at: result.refreshed.marketSnapshotAt
+      });
+    }
+    await sbWrite(\`/rest/v1/sr_v626_market_candidates?fixture_id=eq.\${c.fixtureId}&market_key=eq.\${c.marketKey}&run_id=eq.\${staticData.runId}\`, 'PATCH', patch, diag);
+    return [{ json: { ...c, executionApproved: false, executionReason: result.reasonCode, currentOdd: result.currentOdd } }];
   }
-  return [{ json: { ...c, executionApproved: true, currentOdd } }];
+  // Downstream (Build Pick + Insert) gets the execution-time recomputed
+  // values, not the discovery-time ones -- the official pick reflects the
+  // price it was actually published at.
+  return [{ json: { ...result.refreshed, executionApproved: true, currentOdd: result.currentOdd } }];
 }
 return run();
 `), { notes: 'Reloads the live price for the EXACT fixture/market/line right before publishing and re-runs the full gate. Fails closed on any mismatch, staleness, or price deterioration > 2%. Never falls back to a nearby line, another market, or a stale price.' });
@@ -455,8 +484,11 @@ const codeFinalizeRun = codeNode('Code: Save Run Diagnostics', withLib(`
 ${SB}
 const staticData = $getWorkflowStaticData('global');
 const diag = staticData.diagnostics;
-const row = {
-  run_id: staticData.runId, started_at: staticData.runStartedAt, finished_at: new Date().toISOString(), window: null,
+// PATCH the SAME parent row created by createSelectorRunParent() at the start
+// of this run -- never a second INSERT (run_id is the primary key, and a
+// second row would violate it while also leaving the RUNNING row orphaned).
+const patch = {
+  finished_at: new Date().toISOString(),
   fixtures_fetched: diag.fixturesFetched, fixtures_analyzed: diag.fixturesAnalyzed, fixture_profiles_built: diag.fixtureProfilesBuilt,
   markets_evaluated: diag.marketsEvaluated, candidates_passing_model: diag.candidatesPassingModel,
   candidates_passing_price: diag.candidatesPassingPrice, candidates_passing_calibration: diag.candidatesPassingCalibration,
@@ -465,7 +497,13 @@ const row = {
   provider_requests: diag.providerRequests, provider_retries: diag.providerRetries, provider_errors: diag.providerErrors,
   status: 'COMPLETED', diagnostics: diag
 };
-await sbWrite('/rest/v1/sr_v626_runs', 'POST', [row], diag);
+const finalWrite = await sbWrite(\`/rest/v1/sr_v626_runs?run_id=eq.\${staticData.runId}\`, 'PATCH', patch, diag);
+if (!finalWrite.ok) {
+  // Loud on purpose: this is the terminal step of the run, nothing loops
+  // after it, so surfacing the failure (rather than silently swallowing it)
+  // is the operator signal that the run's own bookkeeping is broken.
+  throw new Error('RUN_FINALIZATION_FAILED status=' + (finalWrite.status || 0) + ' message=' + (finalWrite.message || 'UNKNOWN_DB_ERROR'));
+}
 return [{ json: { runId: staticData.runId, summary: diag } }];
 `), { notes: 'Every Selector run ends here, published or not. This is the single row an operator reads to see exactly what happened this run.' });
 
@@ -643,8 +681,15 @@ const stickyHeader = stickyNote('CONTROL NOTE',
   '- SR626_PROVIDER_API_BASE, SR626_PROVIDER_API_KEY (5DollarFootballAPI PRO)\\n' +
   '- SR626_TELEGRAM_CHAT_ID\\n\\n' +
   '**Required credential**: a Telegram API credential named "Telegram account" (n8n Credentials, not hard-coded).\\n\\n' +
-  'All thresholds live in lib/config.js CONFIG (bundled into every Code node) -- Scanner, Gate and Build all read the same numbers.',
-  [40, 40], [900, 480]
+  'All thresholds live in lib/config.js CONFIG (bundled into every Code node) -- Scanner, Gate and Build all read the same numbers.\\n\\n' +
+  'v6.26.1 fixes (found via real-provider testing): sr_v626_runs parent row is now created (status=RUNNING) BEFORE any ' +
+  'fixture_analysis/market_candidates child write, closing an FK-violation gap in the original design; run_id is always freshly ' +
+  'generated (never reused from stale global static data); the market universe is built only from lines Bet365 actually quoted for ' +
+  'the fixture (no theoretical 49-market padding); Execution Recheck fully recomputes de-vig/calibration/EV/Edge/MarketScore against ' +
+  'the live price rather than gating on stale selection-time numbers; Asian Handicap candidates are explicitly labelled ' +
+  'MARKET_FAMILY_RESEARCH_ONLY instead of a bare null. MAX_PUBLIC_PER_RUN=2 / MAX_PUBLIC_PER_DAY=4 remain enforced -- there is no ' +
+  '"unlimited" mode.',
+  [40, 40], [900, 560]
 );
 
 const stickyModuleA = stickyNote('MODULE A · MARKET SCOUT', 'Collects real Bet365 prices only. No approximate price, no nearest-line fallback, no cross-market substitution. Writes sr_v626_market_snapshots.', [40, 560], [520, 200]);

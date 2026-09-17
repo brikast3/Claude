@@ -1,0 +1,158 @@
+{
+  "name": "TENNIS_4040_MONITOR_v1.0_DRAFT",
+  "nodes": [
+    {
+      "id": "sticky-tennis-4040-readme",
+      "name": "TENNIS 40:40 MONITOR · READ BEFORE ENABLING",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -320
+      ],
+      "parameters": {
+        "width": 620,
+        "height": 460,
+        "content": "## TENNIS 40:40 MONITOR · READ BEFORE ENABLING\nPorts the strategy from the uploaded document (\"Бъдет в гейме счет 40:40 – Да\") into a live-match monitor. This is a NOTIFICATION ONLY skeleton — it does not place bets and does not automate stake sizing.\n\n**Why this is diagnostic-only, not production:**\n- The source document supports the whole system with ONE match (Nadal vs Fognini). That is an anecdote, not a validated edge. Before trusting this for real money, backtest the underlying claim — \"a server who hit deuce in most of their own service games so far in THIS match is likely to hit deuce again in their next service game\" — across many historical finals/semifinals, the same way `football-quant/` backtested Dixon-Coles against real closing odds instead of trusting a README.\n- The document's staking method (\"Правильный Догон\" / progressive loss-chasing) is a Martingale-style system: stake increases after a loss to recover it. That is intentionally NOT implemented here. Automating stake progression on an unvalidated in-match heuristic is a fast path to gambler's ruin, not profit. This workflow only ever proposes a flat, fixed stake in its alert text.\n- Live, in-match, deuce-level detection needs a POINT-BY-POINT (or at least game-by-game with a \"went to deuce\" flag) live tennis data feed with sub-minute latency. The API/KEY constants below are placeholders — no provider is wired up. Candidates to evaluate: Sportradar Tennis, Betradar, BetsAPI (b365api) live scores, RapidAPI tennis-live-data. Confirm the provider's ToS allows this use before wiring it in.\n- Round metadata (Final / Semifinal) must come from the same provider's fixture/tournament data — the engine below assumes a `round` field ('F' / 'SF') exists on each live match object.\n\n**What you still need to supply:**\n1. A real live tennis odds/score provider with per-game server identity and a deuce/game-history array (`match.games[]`).\n2. A Telegram chat ID (or swap the final Code node's output for whatever channel you use).\n3. A backtest period (see `football-quant/` for the methodology) before trusting the deuce-rate threshold `CFG.MIN_DEUCE_RATE` below — it is currently a guess, not a fitted parameter.\n4. A firm decision to keep staking manual and flat. Do not build a \"Dogon\"/progression staking node.\n\nUntil those four are in place, treat every alert this produces as \"worth watching,\" never as a bet."
+      }
+    },
+    {
+      "id": "manual-trigger-tennis",
+      "name": "Manual Trigger: Tennis 40:40",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "schedule-trigger-tennis",
+      "name": "Schedule Trigger: Live Poll (every 1 min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        180
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "code-tennis-engine",
+      "name": "Code: Tennis 40:40 Detector v1.0 DRAFT",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        90
+      ],
+      "parameters": {
+        "jsCode": "const API='https://api.YOUR-TENNIS-LIVE-PROVIDER.com/v1'; // PLACEHOLDER - no live provider wired yet\nconst KEY='REPLACE_WITH_YOUR_TENNIS_API_KEY';\nconst TZ='Europe/Sofia';\n\n// v1.0 DRAFT thresholds. These are NOT fitted from data - the source document gives one\n// worked example (Nadal vs Fognini), not a dataset. Refit MIN_DEUCE_RATE and\n// MIN_SERVICE_SAMPLE against your own backtest of historical finals/semifinals before\n// trusting this for anything beyond \"worth watching.\" See the sticky note above.\nconst CFG={\n  FINAL_ROUNDS:['F','SF','FINAL','SEMIFINAL'],           // criterion 1: final or semifinal only\n  MIN_GAMES_OBSERVED:5,                                  // criterion 2: \"watch 5-6 games\" before acting\n  MIN_SERVICE_SAMPLE:2,                                  // need at least this many completed service games\n                                                          // for THIS server in THIS match before trusting their rate\n  MIN_DEUCE_RATE:0.60,                                   // fraction of that server's own service games so far\n                                                          // that went to 40:40 - UNVALIDATED GUESS, tune via backtest\n  SMALL_SAMPLE_WARNING_BELOW:4,                          // flag alerts built on fewer than this many service games\n  STAKE_NOTE_EUR:20                                      // flat, fixed stake suggested in the alert - never progressive\n};\n\nconst H={Authorization:'Bearer '+KEY,Accept:'application/json'};\n\nasync function getLiveMatches(){\n  // Expected shape (adapt to your chosen provider's real response):\n  // [{ id, round:'F'|'SF'|..., status:'live'|'finished'|'scheduled',\n  //    playerA, playerB, server:'A'|'B',\n  //    games:[{ setNumber, gameNumber, server:'A'|'B', wentToDeuce:boolean, winner:'A'|'B' }, ...] }]\n  return await this.helpers.httpRequest({method:'GET',url:API+'/matches/live',headers:H,json:true,timeout:15000});\n}\n\nfunction serverStats(games, server){\n  const served = games.filter(g => g.server === server);\n  const deuces = served.filter(g => g.wentToDeuce).length;\n  return {\n    gamesServed: served.length,\n    deuceCount: deuces,\n    deuceRate: served.length ? deuces / served.length : 0\n  };\n}\n\nlet matches = [];\ntry {\n  matches = await getLiveMatches.call(this);\n} catch (e) {\n  return [{ json: { error: true, message: 'Live provider call failed: ' + (e?.message || String(e)), engineVersion: 'TENNIS_4040_MONITOR_V1_0_DRAFT' } }];\n}\n\nconst alerts = [];\nfor (const m of (matches || [])) {\n  if (m.status !== 'live') continue;\n  if (!CFG.FINAL_ROUNDS.includes(String(m.round || '').toUpperCase())) continue;\n  const games = m.games || [];\n  if (games.length < CFG.MIN_GAMES_OBSERVED) continue;\n\n  const currentServer = m.server;\n  if (currentServer !== 'A' && currentServer !== 'B') continue;\n\n  const stats = serverStats(games, currentServer);\n  if (stats.gamesServed < CFG.MIN_SERVICE_SAMPLE) continue;\n  if (stats.deuceRate < CFG.MIN_DEUCE_RATE) continue;\n\n  alerts.push({\n    isAlert: true,\n    matchId: m.id,\n    round: m.round,\n    playerA: m.playerA,\n    playerB: m.playerB,\n    server: currentServer,\n    serverName: currentServer === 'A' ? m.playerA : m.playerB,\n    gamesObserved: games.length,\n    serviceGamesSoFar: stats.gamesServed,\n    deuceCount: stats.deuceCount,\n    deuceRate: Number(stats.deuceRate.toFixed(2)),\n    smallSample: stats.gamesServed < CFG.SMALL_SAMPLE_WARNING_BELOW,\n    stakeNoteEur: CFG.STAKE_NOTE_EUR,\n    engineVersion: 'TENNIS_4040_MONITOR_V1_0_DRAFT'\n  });\n}\n\nif (!alerts.length) {\n  return [{ json: { isAlert: false, engineVersion: 'TENNIS_4040_MONITOR_V1_0_DRAFT' } }];\n}\nreturn alerts.map(a => ({ json: a }));\n"
+      }
+    },
+    {
+      "id": "if-tennis-alert",
+      "name": "IF: Alert Condition Met?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        520,
+        90
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-is-alert",
+              "leftValue": "={{ $json.isAlert }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "format-telegram-tennis",
+      "name": "Format: Telegram Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        90
+      ],
+      "parameters": {
+        "jsCode": "const j=$json;if(!j.isAlert)return {json:j};\nconst esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');\nconst roundLabel = String(j.round||'').toUpperCase()==='F' ? 'Финал' : 'Полуфинал';\nconst lines=[\n  `<b>🎾 40:40 НАБЛЮДАТЕЛ – ${esc(roundLabel)}</b>`,\n  '',\n  `<b>${esc(j.playerA)} — ${esc(j.playerB)}</b>`,\n  `🏓 Следващ подавач: <b>${esc(j.serverName)}</b>`,\n  `📊 ${j.deuceCount}/${j.serviceGamesSoFar} от неговите геймове на подаване стигнаха 40:40 (${Math.round(j.deuceRate*100)}%)`,\n  '',\n  `🎯 Възможна проверка: «Ще има 40:40 в гейма – Да» на следващото подаване на ${esc(j.serverName)}`,\n  `💰 Предложен фиксиран залог: ${j.stakeNoteEur} EUR — без прогресия/догон`,\n];\nif (j.smallSample) lines.push('', '⚠️ Малка извадка (' + j.serviceGamesSoFar + ' гейма) – третирай като диагностика, не като сигурен сигнал.');\nlines.push('', '❗ Невалидиран евристик – не е бактестван срещу исторически данни. Решението за залог е ръчно и на собствен риск.');\nconst text=lines.join('\\n').trim();\nreturn {json:{...j,text,telegram_text:text,engineVersion:'TENNIS_4040_MONITOR_V1_0_DRAFT'}};\n"
+      }
+    }
+  ],
+  "connections": {
+    "Manual Trigger: Tennis 40:40": {
+      "main": [
+        [
+          {
+            "node": "Code: Tennis 40:40 Detector v1.0 DRAFT",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger: Live Poll (every 1 min)": {
+      "main": [
+        [
+          {
+            "node": "Code: Tennis 40:40 Detector v1.0 DRAFT",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code: Tennis 40:40 Detector v1.0 DRAFT": {
+      "main": [
+        [
+          {
+            "node": "IF: Alert Condition Met?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Alert Condition Met?": {
+      "main": [
+        [
+          {
+            "node": "Format: Telegram Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  }
+}

@@ -178,3 +178,31 @@ caveats above.
   the same way the model and market probabilities already are, is a common
   next step in the literature if you want a second opinion instead of one
   model's calibration.
+
+## Batch screen: thinner-liquidity leagues (`run_batch_backtest.py`)
+
+The "future work" item above — testing the same fixed-threshold methodology
+on lower divisions and less internationally-bet leagues, where markets get
+much less sharp-money correction than the EPL — now has a runner:
+
+```bash
+python run_batch_backtest.py                       # all 9 leagues x 3 markets
+python run_batch_backtest.py --markets ah           # AH only (thinnest bookmaker margin)
+python run_batch_backtest.py --leagues E1 E2 B1 G1 --markets ah 1x2
+```
+
+Every cell uses the *same* `BacktestConfig` defaults as the EPL run above —
+there is deliberately no per-league tuning knob, to structurally rule out
+the "retune until it looks good" overfitting trap. Read the script's own
+docstring before trusting any single green cell: it screens up to 27
+league/market combinations at once, so a couple of spuriously positive 95%
+CIs are expected by chance alone even if there's truly no edge anywhere —
+any promising cell needs out-of-sample confirmation on fresh seasons before
+it means anything.
+
+**This has not been run against real data.** `www.football-data.co.uk` was
+blocked by organization egress policy in the sandboxed environment this was
+written in (confirmed via `curl`, not a guess) — only exercised end-to-end
+against synthetic data (proves the plumbing works, proves nothing about
+real markets). Run it yourself somewhere with normal internet access and
+read the actual printed table.

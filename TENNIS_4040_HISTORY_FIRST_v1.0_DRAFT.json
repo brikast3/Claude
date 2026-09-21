@@ -1,0 +1,296 @@
+{
+  "name": "TENNIS 40:40 HISTORY-FIRST v1.0 DRAFT · IN-PLAY SIGNAL + STATS · NEEDS PROVIDER",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## TENNIS \"40:40 – DA\" ADAPTATION · READ BEFORE ENABLING\nThis is a fresh in-play signal engine for the manual strategy \"Будет в гейме счет 40:40 – ДА\" (tennis, live/in-play), NOT a port of the football/hockey Module A pre-match Dixon-Coles engine — the market and the data shape are completely different (per-game deuce pattern inside a live match, not a pre-match goal model).\n\n**Strategy criteria this encodes (from the source notes):**\n1. Final or semifinal only (evenly matched opponents produce the pattern most reliably).\n2. Watch at least 5-6 completed games before considering any signal (MIN_HISTORY_GAMES).\n3. Work out which player's OWN service games keep reaching 40:40 — the bet is that the SAME thing happens on their very next service game. The default threshold (MIN_SIGNAL_RATE = 1.0) requires it to have happened in every one of that player's service games so far, matching the \"always\" language in the source notes and the worked example (2 out of 2 = 100%, flagged as an \"ideal signal\").\n\n**What you still need to supply before this fires a live signal:**\n1. A live tennis data feed with POINT-level detail per game (did this game reach 40:40 — i.e. deuce — at any point, plus current server and round), not just the final game score. Most cheap odds/score APIs only expose game-level scores; you need one with a point-by-point or \"reached deuce\" flag (e.g. Sportradar, BetsAPI, or another provider with live point feeds). API/KEY constants below are placeholders — nothing real is wired yet.\n2. A Supabase table `tennis_4040_signals_v1` (columns roughly: id, match_id, tournament, round, player_a, player_b, server, opponent, game_number, set_number, games_played, server_samples, server_hit_rate, opponent_samples, opponent_hit_rate, odds_estimate, ideal_signal, status [pending/hit/miss], created_at, settled_at) — separate from the football/hockey settlement tables.\n3. Your own Telegram bot credentials wired into a real Send node (not included here — this draft stops at building the message text) and, for the stats command, a Telegram Trigger with a filter on the \"📊 Статистика сигналов\" button/text.\n4. A paper-trading period. The example in the source material is 5 signals (4 hits) — far too small a sample to trust; the \"100% history → signal\" heuristic and the reasoning-text thresholds are a reasonable encoding of the manual strategy but are UNVALIDATED at scale.\n\n**Stats formulas (reproduce the existing bot's numbers exactly):**\n- Winrate % = hits / total * 100\n- Breakeven % = 1 / REFERENCE_ODDS * 100 (a configured reference price for this bet type, e.g. ~3.10 — NOT the average of the actual signal odds, which vary game to game)\n- Edge over the line = Winrate % − Breakeven % (simple percentage-point difference)\nThese match the screenshot exactly: 80.0% winrate, 32.3% breakeven @3.10, +47.7% edge.\n\nUntil the four items above are in place, treat every output as a diagnostic, not a bet.",
+        "height": 900,
+        "width": 980
+      },
+      "id": "c4a55710-0000-4000-8000-000000000001",
+      "name": "TENNIS 40:40 ADAPTATION · READ FIRST",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2000,
+        -560
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "c4a55710-0000-4000-8000-000000000002",
+      "name": "Manual Trigger: Tennis 40:40 Signals",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -960,
+        160
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/1 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "c4a55710-0000-4000-8000-000000000003",
+      "name": "Schedule Trigger: Poll Live Match (60s)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -960,
+        320
+      ],
+      "disabled": false,
+      "notes": "Runs every minute. Only useful while a tracked ATP/WTA Final or Semifinal is live — this draft has no match discovery/watchlist step; the live-feed call below is expected to return only matches you're already tracking (or all live matches, filtered by round inside the Code node)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// === CONFIG — replace every PLACEHOLDER before enabling ===\nconst API = 'https://api.YOUR-LIVE-TENNIS-PROVIDER.com/v1'; // needs point-by-point / \"reached deuce\" detail, not just game scores\nconst KEY = 'REPLACE_WITH_YOUR_TENNIS_API_KEY';\nconst SUPABASE = 'https://YOUR-PROJECT-REF.supabase.co';\nconst DB_KEY = 'REPLACE_WITH_YOUR_SUPABASE_SERVICE_KEY';\nconst TELEGRAM_CHAT_ID = 'REPLACE_WITH_TENNIS_TELEGRAM_CHAT_ID';\n\nconst CFG = {\n  ELIGIBLE_ROUNDS: ['F', 'SF'],   // criteria #1: final or semifinal only\n  MIN_HISTORY_GAMES: 5,           // criteria #2: watch 5-6 completed games before considering a signal\n  MIN_SERVER_SAMPLES: 2,          // need at least this many of the server's own service games observed\n  MIN_SIGNAL_RATE: 1.0,           // fraction of own service games that reached 40:40 required to fire (\"always\", per criteria #3)\n  OPPONENT_HOLD_MAX_RATE: 0.5,    // only colors the reasoning text (\"opponent holds serve comfortably\")\n  DEFAULT_ODDS_ESTIMATE: 3.20,\n  SUPABASE_TABLE: 'tennis_4040_signals_v1'\n};\n\nconst H = { Authorization: 'Bearer ' + KEY, Accept: 'application/json' };\nconst DH = { apikey: DB_KEY, Authorization: 'Bearer ' + DB_KEY, 'Content-Type': 'application/json', Accept: 'application/json', Prefer: 'return=representation' };\n\n// Arrow functions so `this` (the node's execution context, for this.helpers.httpRequest)\n// is captured lexically instead of depending on call-site binding.\nconst get = (url) => this.helpers.httpRequest({ method: 'GET', url, headers: H, json: true, timeout: 20000 });\nconst dbGet = (path) => this.helpers.httpRequest({ method: 'GET', url: SUPABASE + path, headers: DH, json: true, timeout: 15000 });\nconst dbPost = (path, body) => this.helpers.httpRequest({ method: 'POST', url: SUPABASE + path, headers: DH, body, json: true, timeout: 15000 });\nconst dbPatch = (path, body) => this.helpers.httpRequest({ method: 'PATCH', url: SUPABASE + path, headers: DH, body, json: true, timeout: 15000 });\n\nconst playerName = (match, key) => (key === 'A' ? match.playerA : match.playerB)?.name || key;\nconst other = (key) => (key === 'A' ? 'B' : 'A');\n\nconst diagnostics = {\n  version: 'TENNIS_4040_HISTORY_FIRST_V1_0_DRAFT',\n  matchesSeen: 0, matchesEligible: 0, settled: 0, signalsEmitted: 0,\n  skipped: { round: 0, notEnoughHistory: 0, notEnoughServerSamples: 0, rateBelowThreshold: 0, alreadySignaled: 0 }\n};\n\nlet live = [];\ntry {\n  const r = await get(API + '/matches/live');\n  live = Array.isArray(r?.data) ? r.data : Array.isArray(r) ? r : [];\n} catch (e) {\n  return [{ json: { isSignal: false, diagnostic: true, error: 'LIVE_FEED_UNAVAILABLE', message: String(e?.message || e), diagnostics } }];\n}\ndiagnostics.matchesSeen = live.length;\n\n// --- PASS 1: settle any pending signals whose target game has since finished ---\nlet pending = [];\ntry {\n  pending = await dbGet('/rest/v1/' + CFG.SUPABASE_TABLE + '?status=eq.pending&select=*');\n  if (!Array.isArray(pending)) pending = [];\n} catch (e) {\n  pending = [];\n}\nfor (const p of pending) {\n  const match = live.find(m => String(m.id) === String(p.match_id));\n  if (!match) continue; // match dropped out of the live feed - not handled here, needs a finished-matches lookback\n  const finishedGame = (match.games || []).find(g => Number(g.gameNumber) === Number(p.game_number));\n  if (!finishedGame) continue; // target game hasn't finished yet\n  const hit = !!finishedGame.reachedDeuce;\n  try {\n    await dbPatch('/rest/v1/' + CFG.SUPABASE_TABLE + '?id=eq.' + encodeURIComponent(p.id), { status: hit ? 'hit' : 'miss', settled_at: new Date().toISOString() });\n    diagnostics.settled++;\n  } catch (e) { /* leave pending, retried on the next poll */ }\n}\n\n// --- PASS 2: look for a new signal on each eligible live match ---\nconst signals = [];\nfor (const match of live) {\n  if (!CFG.ELIGIBLE_ROUNDS.includes(match.round)) { diagnostics.skipped.round++; continue; }\n  diagnostics.matchesEligible++;\n\n  const games = Array.isArray(match.games) ? match.games : [];\n  if (games.length < CFG.MIN_HISTORY_GAMES) { diagnostics.skipped.notEnoughHistory++; continue; }\n\n  const nextServer = match.server; // 'A' | 'B', serving match.currentGameNumber\n  const ownGames = games.filter(g => g.server === nextServer);\n  if (ownGames.length < CFG.MIN_SERVER_SAMPLES) { diagnostics.skipped.notEnoughServerSamples++; continue; }\n\n  const hits = ownGames.filter(g => g.reachedDeuce).length;\n  const rate = hits / ownGames.length;\n  if (rate < CFG.MIN_SIGNAL_RATE) { diagnostics.skipped.rateBelowThreshold++; continue; }\n\n  // idempotency: don't re-signal a match+game we've already flagged\n  let already = [];\n  try {\n    already = await dbGet('/rest/v1/' + CFG.SUPABASE_TABLE + '?match_id=eq.' + encodeURIComponent(match.id) + '&game_number=eq.' + encodeURIComponent(match.currentGameNumber) + '&select=id');\n  } catch (e) { already = []; }\n  if (Array.isArray(already) && already.length) { diagnostics.skipped.alreadySignaled++; continue; }\n\n  const oppKey = other(nextServer);\n  const oppGames = games.filter(g => g.server === oppKey);\n  const oppHits = oppGames.filter(g => g.reachedDeuce).length;\n  const oppRate = oppGames.length ? oppHits / oppGames.length : null;\n\n  const serverName = playerName(match, nextServer);\n  const opponentName = playerName(match, oppKey);\n  const oddsEstimate = Number(match.liveOddsDeuceYes) > 1 ? Number(match.liveOddsDeuceYes) : CFG.DEFAULT_ODDS_ESTIMATE;\n  const idealSignal = rate === 1 && (oppRate === null || oppRate <= CFG.OPPONENT_HOLD_MAX_RATE);\n\n  const signal = {\n    match_id: match.id,\n    tournament: match.tournament,\n    round: match.round,\n    player_a: match.playerA?.name,\n    player_b: match.playerB?.name,\n    server: serverName,\n    opponent: opponentName,\n    game_number: match.currentGameNumber,\n    set_number: match.currentSetNumber,\n    games_played: games.length,\n    server_samples: ownGames.length,\n    server_hit_rate: rate,\n    opponent_samples: oppGames.length,\n    opponent_hit_rate: oppRate,\n    odds_estimate: oddsEstimate,\n    ideal_signal: idealSignal,\n    status: 'pending',\n    created_at: new Date().toISOString()\n  };\n\n  try {\n    await dbPost('/rest/v1/' + CFG.SUPABASE_TABLE, signal);\n  } catch (e) {\n    signal.persistError = String(e?.message || e); // surface it instead of silently losing the signal\n  }\n\n  diagnostics.signalsEmitted++;\n  signals.push({ json: { isSignal: true, telegramChatId: TELEGRAM_CHAT_ID, ...signal, diagnostics } });\n}\n\nif (!signals.length) return [{ json: { isSignal: false, diagnostic: true, message: 'NO QUALIFYING TENNIS SIGNALS', diagnostics } }];\nreturn signals;\n"
+      },
+      "id": "c4a55710-0000-4000-8000-000000000004",
+      "name": "Code: Tennis 40:40 Signal Engine v1.0 DRAFT",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -640,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c4a55710-0000-4000-8000-000000000001-a",
+              "leftValue": "={{ $json.isSignal }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c4a55710-0000-4000-8000-000000000005",
+      "name": "IF: Signal Ready?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -256,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $json;\nif (!j.isSignal) return { json: j };\n\nconst roundLabel = j.round === 'F' ? 'Финал' : j.round === 'SF' ? 'Полуфинал' : (j.round || '');\nconst pct = (v) => (Number(v) * 100).toFixed(1);\nconst hitCount = Math.round(j.server_hit_rate * j.server_samples);\n\nconst reason = [];\nreason.push(j.ideal_signal ? '🔥 Идеальный сигнал!' : '⚠️ Сигнал (ниже идеального порога)');\nreason.push(`В матче ${j.player_a} — ${j.player_b} (${roundLabel}) в гейме №${j.game_number} подает ${j.server}.`);\nreason.push(`На его подаче счет 40:40 был в ${hitCount} из ${j.server_samples} геймов (${pct(j.server_hit_rate)}%).`);\nif (j.opponent_hit_rate !== null && j.opponent_hit_rate <= 0.5) {\n  reason.push(`При этом соперник держит подачу уверенно, поэтому ${j.server} вынужден вгрызаться в каждый розыгрыш на своей подаче.`);\n}\n\nconst lines = [\n  '🚨 СИГНАЛ НА СТАВКУ!',\n  `🎾 ${j.player_a} — ${j.player_b}`,\n  `🏆 Турнир: ${j.tournament}${roundLabel ? ' (' + roundLabel + ')' : ''}`,\n  `📊 Сыграно геймов: ${j.games_played}`,\n  `🎯 Следующий гейм: №${j.game_number} (подает ${j.server})`,\n  '👉 Ставка: 40:40 — ДА',\n  `📈 Ориентир кэфа: ~${Number(j.odds_estimate).toFixed(2)}`,\n  `💬 Причина: ${reason[0]}`,\n  ...reason.slice(1)\n];\n\nconst text = lines.join('\\n');\nreturn { json: { ...j, text, telegram_text: text, engineVersion: 'TENNIS_4040_HISTORY_FIRST_V1_0_DRAFT' } };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "c4a55710-0000-4000-8000-000000000006",
+      "name": "Format: Telegram Signal Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        80,
+        160
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "c4a55710-0000-4000-8000-000000000007",
+      "name": "Manual Trigger: Stats Command (test)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -960,
+        560
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ]
+      },
+      "id": "c4a55710-0000-4000-8000-000000000008",
+      "name": "Telegram Trigger: Stats Command",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -960,
+        720
+      ],
+      "disabled": true,
+      "notes": "DISABLED — assign your Telegram Trigger credential, then enable this node once it's wired. Filters on the '📊 Статистика сигналов' button/text via the IF node right after it."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c4a55710-0000-4000-8000-000000000001-b",
+              "leftValue": "={{ $json.message?.text }}",
+              "rightValue": "📊 Статистика сигналов",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c4a55710-0000-4000-8000-000000000009",
+      "name": "IF: Stats Command Text?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -640,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// === CONFIG — replace before enabling ===\nconst SUPABASE = 'https://YOUR-PROJECT-REF.supabase.co';\nconst DB_KEY = 'REPLACE_WITH_YOUR_SUPABASE_SERVICE_KEY';\nconst REFERENCE_ODDS = 3.10; // reference price for this bet type, used only for the breakeven calc below — NOT the average of actual signal odds\nconst HISTORY_LIMIT = 5;\nconst SUPABASE_TABLE = 'tennis_4040_signals_v1';\n\nconst DH = { apikey: DB_KEY, Authorization: 'Bearer ' + DB_KEY, Accept: 'application/json' };\nconst dbGet = (path) => this.helpers.httpRequest({ method: 'GET', url: SUPABASE + path, headers: DH, json: true, timeout: 15000 });\n\nlet rows = [];\ntry {\n  rows = await dbGet('/rest/v1/' + SUPABASE_TABLE + '?status=in.(hit,miss)&order=created_at.desc&select=*');\n  if (!Array.isArray(rows)) rows = [];\n} catch (e) {\n  return [{ json: { error: 'STATS_QUERY_FAILED', message: String(e?.message || e) } }];\n}\n\nconst total = rows.length;\nconst hits = rows.filter(r => r.status === 'hit').length;\nconst misses = total - hits;\nconst winratePct = total ? (hits / total) * 100 : 0;\n// Breakeven% = 1 / odds * 100; Edge = winrate% - breakeven% (matches the existing bot's\n// 80.0% / 32.3% @3.10 / +47.7% exactly).\nconst breakevenPct = (1 / REFERENCE_ODDS) * 100;\nconst edgePct = winratePct - breakevenPct;\n\nconst history = rows.slice(0, HISTORY_LIMIT).map(r => ({\n  hit: r.status === 'hit',\n  gameNumber: r.game_number,\n  server: r.server,\n  odds: r.odds_estimate\n}));\n\nreturn [{ json: { total, hits, misses, winratePct, breakevenPct, edgePct, referenceOdds: REFERENCE_ODDS, history } }];\n"
+      },
+      "id": "c4a55710-0000-4000-8000-000000000010",
+      "name": "Code: Compute Signal Statistics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -256,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $json;\nif (j.error) return { json: j };\n\nconst pct = (v) => Number(v).toFixed(1);\nconst lines = [\n  '📊 СТАТИСТИКА СИГНАЛОВ «40:40 — ДА»',\n  '━━━━━━━━━━━━━━━━━━',\n  `🎯 Всего сигналов: ${j.total}`,\n  `✅ Зашло (было 40:40): ${j.hits}`,\n  `❌ Не зашло: ${j.misses}`,\n  `📈 Винрейт: ${pct(j.winratePct)}%`,\n  `⚖️ Точка окупаемости (при кэфе ~${Number(j.referenceOdds).toFixed(2)}): ${pct(j.breakevenPct)}%`,\n  `⚡ Перевес над линией: ${j.edgePct >= 0 ? '+' : ''}${pct(j.edgePct)}%`,\n  '━━━━━━━━━━━━━━━━━━',\n  '📜 История последних сигналов:',\n  ...j.history.map(h => `${h.hit ? '✅' : '❌'} Гейм ${h.gameNumber} (${h.server}): ${h.hit ? '40:40 БЫЛО' : 'без 40:40'} (кэф ${Number(h.odds).toFixed(2)})`)\n];\n\nconst text = lines.join('\\n');\nreturn { json: { ...j, text, telegram_text: text } };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "c4a55710-0000-4000-8000-000000000011",
+      "name": "Format: Telegram Stats Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        80,
+        640
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Trigger: Tennis 40:40 Signals": {
+      "main": [
+        [
+          {
+            "node": "Code: Tennis 40:40 Signal Engine v1.0 DRAFT",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger: Poll Live Match (60s)": {
+      "main": [
+        [
+          {
+            "node": "Code: Tennis 40:40 Signal Engine v1.0 DRAFT",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code: Tennis 40:40 Signal Engine v1.0 DRAFT": {
+      "main": [
+        [
+          {
+            "node": "IF: Signal Ready?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Signal Ready?": {
+      "main": [
+        [
+          {
+            "node": "Format: Telegram Signal Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Manual Trigger: Stats Command (test)": {
+      "main": [
+        [
+          {
+            "node": "Code: Compute Signal Statistics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Trigger: Stats Command": {
+      "main": [
+        [
+          {
+            "node": "IF: Stats Command Text?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Stats Command Text?": {
+      "main": [
+        [
+          {
+            "node": "Code: Compute Signal Statistics",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Code: Compute Signal Statistics": {
+      "main": [
+        [
+          {
+            "node": "Format: Telegram Stats Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

@@ -1,0 +1,1585 @@
+{
+  "name": "SOCCER RADAR · FUSION ENGINE v1.5.3.18 · PRODUCTION CLEANUP",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## FUSION ENGINE v1.4.2 · AUDITED PRODUCTION FIX\n\nProduction audit corrections:\n- No daily cap. No one-market-per-fixture cap.\n- Exact-signal duplicate protection retained.\n- MONEYLINE now reaches Fusion instead of being silently excluded.\n- MONEYLINE Fusion uses calibrated Poisson/DC core + lambda result balance + venue-form result evidence. EV/edge remain excluded from Fusion Score.\n- Final fixture recheck window aligned with main T-20..T-50 gate.\n- Final provider authentication aligned with discovery/model loader.\n- GOALS/BTTS independent-value architecture retained.\n- COMBO markets are NOT included.\n\nAudit note: database-level unique protection is still recommended to make duplicate prevention atomic across overlapping executions."
+      },
+      "id": "9c932847-dbbf-4098-ad50-85aed301068b",
+      "name": "CONTROL NOTE · v1.4.2 ALL QUALIFIED MARKETS",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1008,
+        1504
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/10 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "502f39e6-75e8-4f43-bc70-033be48db45a",
+      "name": "Schedule Trigger · T-30 Engine 24x7 every 10m",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -960,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst API_BASE=$env.SR626_PROVIDER_API_BASE || 'https://api.5dollarfootballapi.com/v1';\nconst API_KEY=$env.SR626_PROVIDER_API_KEY || 'SET_SR626_PROVIDER_API_KEY_IN_N8N_ENV';\nconst headers={'x-api-key':API_KEY,'accept':'application/json'};\nconst sleep=ms=>new Promise(r=>setTimeout(r,ms));\nconst clamp=(x,a,b)=>Math.max(a,Math.min(b,x));\nconst num=x=>x==null?null:Number(x);\nconst isFin=x=>Number.isFinite(Number(x));\nasync function get(path){\n  for(let a=0;a<3;a++){\n    try{\n      const r=await this.helpers.httpRequest({method:'GET',url:API_BASE+path,headers,json:true,returnFullResponse:true,ignoreHttpStatusErrors:true,timeout:20000});\n      const sc=Number(r?.statusCode||0);\n      if(sc>=200&&sc<300)return r.body;\n      if(![408,429,500,502,503,504].includes(sc))return null;\n    }catch(e){ if(a===2)return null; }\n    await sleep(a===0?7000:11000);\n  }\n  return null;\n}\nconst data=x=>x?.data??x;\nconst finished=(arr,currentId)=>((Array.isArray(data(arr))?data(arr):[]).filter(x=>Number(x?.id)!==Number(currentId)&&String(x?.status||'').toLowerCase()==='finished'&&isFin(x?.goals?.home)&&isFin(x?.goals?.away)));\nconst venueRows=(arr,teamId,venue,currentId)=>finished(arr,currentId)\n  .filter(x=>Number(x?.teams?.[venue]?.id)===Number(teamId))\n  .sort((a,b)=>Number(b?.kickoff_ts||0)-Number(a?.kickoff_ts||0));\nconst avg=(a)=>a.length?a.reduce((s,x)=>s+x,0)/a.length:null;\nconst weightedAvg=(rows,fn)=>{\n  if(!rows.length)return null;\n  const w=[1,.92,.84,.76,.68,.60,.54,.48,.43,.38,.34,.30,.27,.24,.21];\n  let s=0,z=0; rows.slice(0,15).forEach((r,i)=>{const v=fn(r);if(isFin(v)){s+=Number(v)*(w[i]||.2);z+=(w[i]||.2);}});\n  return z?s/z:null;\n};\nfunction pois(l,k){return Math.exp(-l)*Math.pow(l,k)/factorial(k)} function factorial(n){let r=1;for(let i=2;i<=n;i++)r*=i;return r}\nfunction grid(lh,la){\n  const g=[];let z=0;\n  for(let h=0;h<=7;h++)for(let a=0;a<=7;a++){let p=pois(lh,h)*pois(la,a);if(h===0&&a===0)p*=1-.08*lh*la;else if(h===0&&a===1)p*=1+.08*lh;else if(h===1&&a===0)p*=1+.08*la;else if(h===1&&a===1)p*=1-.08;p=Math.max(0,p);g.push({h,a,p});z+=p}\n  return g.map(x=>({...x,p:x.p/z}));\n}\nfunction probs(g){\n let H=0,D=0,A=0,BY=0; for(const x of g){if(x.h>x.a)H+=x.p;else if(x.h===x.a)D+=x.p;else A+=x.p;if(x.h>0&&x.a>0)BY+=x.p}\n return {H,D,A,BY,BN:1-BY,DC1X:H+D,DCX2:D+A,DC12:H+A};\n}\n\nfunction splitQuarter(line){\n const q=Math.round(Number(line)*4)/4;\n const isQuarter=Math.abs(q*2-Math.round(q*2))>1e-9;\n return isQuarter?[Math.floor(q*2)/2,Math.ceil(q*2)/2]:[q];\n}\nfunction legResult(v){return v>1e-12?1:v<-1e-12?-1:0}\nfunction expectedAsianEV(g,line,side,odd,family){\n const legs=splitQuarter(line), stake=1/legs.length;\n let ev=0, fullWin=0, fullLose=0, push=0, halfWin=0, halfLose=0;\n for(const x of g){\n   let outcomeProfit=0, rs=[];\n   for(const L of legs){\n     let d;\n     if(family==='GOALS'){\n       const t=x.h+x.a;\n       d=side==='OVER'?t-L:L-t;\n     }else{\n       const diff=side==='HOME'?x.h-x.a:x.a-x.h;\n       d=diff+L;\n     }\n     const r=legResult(d); rs.push(r);\n     outcomeProfit += r>0?stake*(odd-1):r<0?-stake:0;\n   }\n   ev += x.p*outcomeProfit;\n   if(rs.every(r=>r>0)) fullWin+=x.p;\n   else if(rs.every(r=>r<0)) fullLose+=x.p;\n   else if(rs.some(r=>r>0)&&rs.some(r=>r===0)) halfWin+=x.p;\n   else if(rs.some(r=>r<0)&&rs.some(r=>r===0)) halfLose+=x.p;\n   else push+=x.p;\n }\n return {ev,fullWin,fullLose,halfWin,halfLose,push};\n}\n\nfunction asianProfile(a,odd){\n if(!a||!isFin(odd)) return null;\n const winEq=(Number(a.fullWin)||0)+0.5*(Number(a.halfWin)||0);\n const loseEq=(Number(a.fullLose)||0)+0.5*(Number(a.halfLose)||0);\n const resolvedEq=winEq+loseEq;\n const fairOdd=winEq>1e-12?1+(loseEq/winEq):null;\n const rawEv=Number(a.ev)||0;\n return {\n   full_win:Number(a.fullWin)||0,\n   half_win:Number(a.halfWin)||0,\n   push:Number(a.push)||0,\n   half_loss:Number(a.halfLose)||0,\n   full_loss:Number(a.fullLose)||0,\n   win_equivalent:winEq,\n   loss_equivalent:loseEq,\n   resolved_equivalent:resolvedEq,\n   fair_odd_model:fairOdd,\n   raw_expected_return:rawEv,\n   raw_ev_pct:rawEv*100\n };\n}\nfunction settlementAwareShadowScore(profile,calEv,dq,hist,move=0,nH=0,nA=0){\n if(!profile) return null;\n const sample=clamp(Math.min(nH,nA)/15*100,0,100);\n const resolved=Math.max(Number(profile.resolved_equivalent)||0,1e-9);\n const directionalStrength=clamp(Math.abs((profile.win_equivalent-profile.loss_equivalent)/resolved)*100,0,100);\n const priceValue=clamp(50+(Number(calEv)||0)*220,0,100);\n const settlementCertainty=clamp(resolved*100,0,100);\n return .25*directionalStrength + .20*hist + .15*dq + .15*settlementCertainty +\n        .10*sample + .10*priceValue + .05*sample + move;\n}\n\nfunction binaryProb(g,line,side,family){\n let w=0,l=0,p=0;\n for(const x of g){\n   let d;\n   if(family==='GOALS'){\n     const t=x.h+x.a; d=side==='OVER'?t-line:line-t;\n   }else{\n     const diff=side==='HOME'?x.h-x.a:x.a-x.h; d=diff+line;\n   }\n   const r=legResult(d); if(r>0)w+=x.p; else if(r<0)l+=x.p; else p+=x.p;\n }\n return w+l>0?w/(w+l):0;\n}\nfunction devig2(a,b){if(!isFin(a)||!isFin(b)||a<=1||b<=1)return null;const x=1/a,y=1/b,z=x+y;return [x/z,y/z]}\nfunction modelWeight(dq,hist,nH,nA){\n const sample=clamp(Math.min(nH,nA)/15,0,1);\n const quality=clamp((dq/100)*(hist/100),0,1);\n return clamp(0.20+0.45*sample*quality,0.20,0.65);\n}\nfunction marketScore(pCal,mp,dq,hist,odd,ev,move=0,nH=0,nA=0){\n const sample=clamp(Math.min(nH,nA)/15*100,0,100);\n const probStrength=clamp(Math.abs(pCal-.5)*200,0,100);\n const agreement=mp==null?45:clamp(100-Math.abs(pCal-mp)*180,0,100);\n const priceValue=clamp(50+ev*220,0,100);\n const leagueReliability=sample;\n return .25*probStrength + .20*hist + .15*dq + .15*agreement +\n        .10*sample + .10*priceValue + .05*leagueReliability + move;\n}\nfunction add(cands,fam,key,side,line,odd,pRaw,marketP,opening,dq,hist,nH,nA,rawEVOverride=null,publicEligible=true,asianEVBreakdown=null){\n if(!isFin(odd)||odd<1.01||!isFin(pRaw))return;\n const mw=modelWeight(dq,hist,nH,nA);\n const mp=isFin(marketP)?Number(marketP):1/Number(odd);\n const pCal=clamp(mw*pRaw+(1-mw)*mp,0.01,0.99);\n const hasOverride=rawEVOverride!==null&&rawEVOverride!==undefined&&isFin(rawEVOverride);\n const rawEV=hasOverride?Number(rawEVOverride):(pRaw*odd-1);\n // Market-implied EV is approximately zero after devig; shrink raw model EV by model weight.\n const calEV=hasOverride\n   ? rawEV*mw\n   : (pCal*Number(odd)-1);\n const edgeRaw=pRaw-mp;\n const edgeCal=edgeRaw*mw;\n const movement=(isFin(opening)&&opening>1)?((opening-odd)/opening*100):null;\n const movementClass=movement==null?'UNKNOWN':movement>2?'CONFIRMED':movement<-2?'AGAINST':'NEUTRAL';\n const moveAdj=movementClass==='CONFIRMED'?3:movementClass==='AGAINST'?-6:0;\n const asianSettlementProfile=asianProfile(asianEVBreakdown,Number(odd));\n if(asianSettlementProfile){\n   asianSettlementProfile.calibrated_expected_return=calEV;\n   asianSettlementProfile.calibrated_ev_pct=calEV*100;\n   asianSettlementProfile.current_odd=Number(odd);\n   asianSettlementProfile.shadow_edge_pct=isFin(asianSettlementProfile.fair_odd_model)&&asianSettlementProfile.fair_odd_model>0\n     ? (Number(odd)/asianSettlementProfile.fair_odd_model-1)*100 : null;\n }\n const settlementShadowScore=asianSettlementProfile\n   ? settlementAwareShadowScore(asianSettlementProfile,calEV,dq,hist,moveAdj,nH,nA)\n   : null;\n cands.push({\n   market_family:fam,market_key:key,side,line,odd:Number(odd),current_odd:Number(odd),\n   model_probability:pRaw,model_probability_calibrated:pCal,market_probability:mp,\n   raw_model_ev:rawEV,calibrated_ev:calEV,calibrated_edge_pp:edgeCal,\n   opening_odd:isFin(opening)?Number(opening):null,\n   opening_to_current_pct:movement,scout_odd:Number(odd),scout_to_current_pct:0,\n   movement_pct:movement,movement_class:movementClass,moveAdj,\n   model_weight:mw,public_eligible:publicEligible,\n   asian_settlement_profile:asianSettlementProfile,\n   settlement_shadow_score:settlementShadowScore\n });\n}\nconst inp=$input.first().json;\nconst allFixtures=Array.isArray(inp.fixtures)?inp.fixtures:[];\nconst MAX_FIXTURES_PER_RUN=12;\nconst ordered=[...allFixtures].sort((a,b)=>{\n  const ka=Date.parse(a?.kickoff||'')||0, kb=Date.parse(b?.kickoff||'')||0;\n  if(ka!==kb)return ka-kb;\n  return Number(a?.fixture_id||0)-Number(b?.fixture_id||0);\n});\nconst groups=Math.max(1,Math.ceil(ordered.length/MAX_FIXTURES_PER_RUN));\nconst rotationSlot=groups>1?(Math.floor(Date.now()/600000)%groups):0;\nconst startIndex=rotationSlot*MAX_FIXTURES_PER_RUN;\nconst fixtures=ordered.slice(startIndex,startIndex+MAX_FIXTURES_PER_RUN);\nconst modelRunMeta={\n  inputFixtures:allFixtures.length,\n  selectedFixtures:fixtures.length,\n  deferredFixtures:Math.max(0,allFixtures.length-fixtures.length),\n  rotationSlot,\n  rotationGroups:groups,\n  maxFixturesPerRun:MAX_FIXTURES_PER_RUN\n};\n\n// v1.5.1 DUAL-SOURCE HISTORY: API-Football Free is a budgeted H2H verifier/fallback.\nconst AF_KEY=$env.API_FOOTBALL_KEY || '7994b4c0516ad67b9a6c433a1eedb085';\nconst SB_URL=$env.SUPABASE_URL || 'https://nhgqksizfyumdqmuuznx.supabase.co';\nconst SB_KEY=$env.SUPABASE_SERVICE_KEY || 'SET_SUPABASE_SECRET_IN_N8N_ENV';\nconst AF_DAILY_BUDGET=60;\nconst __normName=s=>String(s||'').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').replace(/[^a-z0-9]+/g,' ').trim();\nconst __clubStop=new Set(['fc','cf','sc','ac','ec','afc','club','clube','futebol','football','soccer','esporte','esportivo','de','do','da','the']);\nconst __nameTokens=s=>__normName(s).split(' ').filter(Boolean).filter(t=>!__clubStop.has(t));\nconst __tokenScore=(a,b)=>{const A=new Set(__nameTokens(a)),B=new Set(__nameTokens(b));if(!A.size||!B.size)return 0;let i=0;for(const x of A)if(B.has(x))i++;const u=new Set([...A,...B]).size;return u?i/u:0;};\nconst __countryFrom=(country,league)=>{if(country)return String(country);const l=__normName(league);const map=[['brazil','Brazil'],['brasil','Brazil'],['ecuador','Ecuador'],['uruguay','Uruguay'],['argentina','Argentina'],['chile','Chile'],['colombia','Colombia'],['peru','Peru'],['mexico','Mexico'],['spain','Spain'],['italy','Italy'],['germany','Germany'],['france','France'],['england','England'],['portugal','Portugal'],['netherlands','Netherlands'],['belgium','Belgium'],['turkey','Turkey'],['turkiye','Turkey'],['greece','Greece'],['austria','Austria'],['switzerland','Switzerland'],['denmark','Denmark'],['norway','Norway'],['sweden','Sweden'],['poland','Poland'],['romania','Romania'],['bulgaria','Bulgaria'],['croatia','Croatia'],['serbia','Serbia'],['slovenia','Slovenia'],['slovakia','Slovakia'],['czech','Czech-Republic'],['usa','USA'],['united states','USA']];for(const [k,v] of map)if(l.includes(k))return v;return null;};\nasync function __sbReq(opts){\n if(!SB_URL||!SB_KEY)return null;\n try{return await this.helpers.httpRequest({...opts,headers:{apikey:SB_KEY,Authorization:`Bearer ${SB_KEY}`,...(opts.headers||{})},json:true,ignoreHttpStatusErrors:true,timeout:15000});}catch(e){return null;}\n}\nasync function __afUsedToday(){\n if(!SB_URL||!SB_KEY)return AF_DAILY_BUDGET; const day=new Date().toISOString().slice(0,10);\n const r=await __sbReq.call(this,{method:'GET',url:SB_URL.replace(/\\/$/,'')+`/rest/v1/sr_fusion_api_usage?provider=eq.API_FOOTBALL&usage_day=eq.${day}&select=id`});\n return Array.isArray(r)?r.length:AF_DAILY_BUDGET;\n}\nasync function __afLog(endpoint,status){\n if(!SB_URL||!SB_KEY)return; const day=new Date().toISOString().slice(0,10);\n const tag=`${String(status||'UNKNOWN')}:${String(endpoint||'').split('?')[0]}`.slice(0,120);\n await __sbReq.call(this,{method:'POST',url:SB_URL.replace(/\\/$/,'')+'/rest/v1/sr_fusion_api_usage',headers:{Prefer:'return=minimal'},body:{provider:'API_FOOTBALL',usage_day:day,endpoint:tag}});\n}\nasync function __afGet(path){\n if(!AF_KEY)return {ok:false,reason:'NO_KEY',body:null};\n const used=await __afUsedToday.call(this); if(used>=AF_DAILY_BUDGET)return {ok:false,reason:'DAILY_BUDGET',body:null};\n try{\n   const r=await this.helpers.httpRequest({method:'GET',url:'https://v3.football.api-sports.io'+path,headers:{'x-apisports-key':AF_KEY},json:true,returnFullResponse:true,ignoreHttpStatusErrors:true,timeout:20000});\n   const sc=Number(r?.statusCode||0), body=r?.body??null;\n   const errObj=body?.errors;\n   const apiErrors=errObj && (Array.isArray(errObj)?errObj.length:Object.keys(errObj||{}).length);\n   const errSummary=apiErrors ? (Array.isArray(errObj)?errObj.slice(0,3):Object.fromEntries(Object.entries(errObj||{}).slice(0,3))) : null;\n   const responseCount=Array.isArray(body?.response)?body.response.length:null;\n   const resultsCount=Number.isFinite(Number(body?.results))?Number(body.results):null;\n   const bodyKeys=body&&typeof body==='object'?Object.keys(body).slice(0,12):[];\n   const ok=sc>=200&&sc<300&&!apiErrors;\n   const reason=ok?'SUCCESS':(sc===429?'RATE_LIMIT':(apiErrors?'API_ERRORS':(sc?`HTTP_${sc}`:'API_ERROR')));\n   await __afLog.call(this,path,ok?'SUCCESS':reason);\n   return {ok,reason,body,statusCode:sc,diagnostic:{http_status:sc,body_keys:bodyKeys,get:body?.get??null,parameters:body?.parameters??null,results:resultsCount,response_count:responseCount,paging:body?.paging??null,errors:errSummary}};\n }catch(e){\n   await __afLog.call(this,path,'NETWORK_ERROR');\n   return {ok:false,reason:'NETWORK_ERROR',body:null,statusCode:0,diagnostic:{http_status:0,body_keys:[],get:null,parameters:null,results:null,response_count:null,paging:null,errors:{network_error:String(e?.message||e||'NETWORK_ERROR').slice(0,300)}}};\n }\n}\nasync function __cachedH2H(pairKey,homeName,awayName){\n if(!SB_URL||!SB_KEY)return null; const now=encodeURIComponent(new Date().toISOString());\n const u=SB_URL.replace(/\\/$/,'')+`/rest/v1/sr_fusion_h2h_cache?pair_key=eq.${encodeURIComponent(pairKey)}&expires_at=gt.${now}&select=*&limit=1`;\n const r=await __sbReq.call(this,{method:'GET',url:u});\n const row=Array.isArray(r)&&r.length?r[0]:null; if(!row)return null;\n const wanted=[__normName(homeName),__normName(awayName)].sort().join('|');\n const stored=[__normName(row.home_team_name),__normName(row.away_team_name)].sort().join('|');\n if(!wanted||wanted!==stored)return null;\n if(!Number(row.api_home_team_id)||!Number(row.api_away_team_id))return null;\n return row;\n}\nasync function __saveH2H(row){\n if(!SB_URL||!SB_KEY)return; const u=SB_URL.replace(/\\/$/,'')+'/rest/v1/sr_fusion_h2h_cache?on_conflict=pair_key';\n await __sbReq.call(this,{method:'POST',url:u,headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:row});\n}\nasync function __cachedAfTeam(providerTeamId,name,country){\n if(!SB_URL||!SB_KEY||!Number(providerTeamId))return null;\n const u=SB_URL.replace(/\\/$/,'')+`/rest/v1/sr_fusion_team_map?provider_team_id=eq.${Number(providerTeamId)}&select=*&limit=1`;\n const r=await __sbReq.call(this,{method:'GET',url:u});\n const row=Array.isArray(r)&&r.length?r[0]:null;if(!row||!Number(row.api_team_id))return null;\n if(name&&row.provider_team_name&&__normName(name)!==__normName(row.provider_team_name))return null;\n if(country&&row.country&&__normName(country)!==__normName(row.country))return null;\n return row;\n}\nasync function __saveAfTeam(providerTeamId,name,country,resolution){\n if(!SB_URL||!SB_KEY||!Number(providerTeamId)||!Number(resolution?.id))return;\n const u=SB_URL.replace(/\\/$/,'')+'/rest/v1/sr_fusion_team_map?on_conflict=provider_team_id';\n await __sbReq.call(this,{method:'POST',url:u,headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:{provider_team_id:Number(providerTeamId),provider_team_name:String(name||''),country:country||null,api_team_id:Number(resolution.id),api_team_name:resolution.matched_name||null,confidence:Number(resolution.confidence||0),resolution_reason:resolution.reason||null,verified_at:new Date().toISOString(),updated_at:new Date().toISOString()}});\n}\nasync function __resolveAfTeam(name,ctx={}){\n const country=__countryFrom(ctx.country,ctx.league);\n const original=String(name||'').trim(), normOriginal=__normName(original);\n const cached=await __cachedAfTeam.call(this,ctx.providerTeamId,original,country);\n if(cached)return {id:Number(cached.api_team_id),reason:'TEAM_MAP_CACHE',confidence:Number(cached.confidence||1),matched_name:cached.api_team_name||null,candidates:[],search_attempts:[]};\n const youthRe=/(^|\\s)(u\\s?1[789]|u\\s?2[013]|under\\s?1[789]|under\\s?2[013]|youth|junior|juniors|reserve|reserves|women|w)(\\s|$)/i;\n const originalYouth=youthRe.test(normOriginal);\n const stripClub=s=>__normName(s).split(' ').filter(Boolean).filter(t=>!__clubStop.has(t)).join(' ');\n const stripRegion=s=>stripClub(s).split(' ').filter(t=>!['mg','sp','rj','rs','pr','sc','ba','pe','ce','go','df','pa','pb','rn','al','se','ma','pi','mt','ms','es','ro','rr','am','ac','ap','to'].includes(t)).join(' ');\n   const variants=[];\n  const addVariant=v=>{const x=String(v||'').trim();const nx=__normName(x);if(x&&nx.length>=3&&!variants.some(y=>__normName(y)===nx))variants.push(x);};\n  const aliasBase=stripRegion(original),parts=aliasBase.split(' ').filter(Boolean);\n  addVariant(original); addVariant(stripClub(original)); addVariant(aliasBase);\n  // Multi-word alias passes. Keep them conservative: preserve useful name chunks,\n  // then let country/category + similarity scoring decide. Never auto-accept a token alone.\n  if(parts.length>=3){\n    addVariant(parts.slice(0,2).join(' '));\n    addVariant(parts.slice(-2).join(' '));\n    if(['real','deportivo','atletico','athletic','club','sporting','union'].includes(parts[0])) addVariant([parts[0],parts[parts.length-1]].join(' '));\n  }\n  if(parts.length>=2){\n    for(const t of parts){if(t.length>=5&&!['club','futbol','football','deportivo','athletic','atletico','sporting'].includes(t))addVariant(t);}\n  }\n const merged=new Map(),attempts=[];\n  for(const search of variants.slice(0,6)){\n   const rr=await __afGet.call(this,'/teams?search='+encodeURIComponent(search));\n   attempts.push({search,ok:rr.ok,reason:rr.reason,api_diagnostic:rr.diagnostic||null});\n   if(!rr.ok){if(rr.reason==='DAILY_BUDGET'||rr.reason==='RATE_LIMIT')break;continue;}\n   for(const x of (Array.isArray(rr.body?.response)?rr.body.response:[])){\n     const id=Number(x?.team?.id)||null,tn=String(x?.team?.name||''),tc=String(x?.team?.country||''); if(!id||!tn)continue;\n     const categoryOk=originalYouth===youthRe.test(__normName(tn));\n     const exact=__normName(tn)===normOriginal, countryOk=!country||__normName(tc)===__normName(country);\n     let score=exact?1:__tokenScore(original,tn); if(countryOk)score=Math.min(1,score+0.08); else if(country)score*=0.55; if(!categoryOk)score=0;\n     const row={id,name:tn,country:tc,score:+score.toFixed(4),exact,countryOk,categoryOk,matched_via:search}; const prev=merged.get(id); if(!prev||row.score>prev.score)merged.set(id,row);\n   }\n   const interim=[...merged.values()].filter(x=>x.categoryOk).sort((a,b)=>b.score-a.score),b=interim[0],s=interim[1];\n   if(b&&((b.exact&&b.countryOk)||(b.score>=0.90&&b.score-(s?.score||0)>=0.08)))break;\n }\n const scored=[...merged.values()].filter(x=>x.categoryOk).sort((a,b)=>b.score-a.score),best=scored[0],second=scored[1];\n if(!best)return {id:null,reason:merged.size?'CATEGORY_MISMATCH':'NO_RESULTS',confidence:0,candidates:[],search_attempts:attempts};\n const margin=best.score-(second?.score||0),base={confidence:best.score,matched_name:best.name,candidates:scored.slice(0,5),search_attempts:attempts};\n if(best.exact&&best.countryOk)return {id:best.id,reason:'EXACT_CONTEXT_MATCH',...base};\n if(best.score>=0.90&&margin>=0.08)return {id:best.id,reason:'HIGH_CONFIDENCE_NAME_CONTEXT',...base};\n if(best.score>=0.75&&country&&best.countryOk&&margin>=0.15)return {id:best.id,reason:'CROSSCHECKED_CONTEXT_MATCH',...base};\n // Conservative rename/alias rule: API-Football sometimes drops a locality token\n // (e.g. Real Soacha Cundinamarca -> Real Cundinamarca). Accept only when the\n // candidate is senior/same category, same country, unique, has >=2 meaningful\n // tokens, and every candidate token exists in the provider name. This is not a\n // generic fuzzy-threshold reduction.\n const aliasStop=new Set(['fc','cf','sc','ac','ec','afc','club','clube','futebol','football','soccer','de','do','da','the']);\n const toks=v=>__normName(v).split(' ').filter(t=>t&&!aliasStop.has(t));\n const ot=toks(original),bt=toks(best.name);\n const subsetAlias=best.countryOk&&best.categoryOk&&bt.length>=2&&bt.every(t=>ot.includes(t))&&best.score>=0.72&&margin>=0.15;\n if(subsetAlias)return {id:best.id,reason:'UNIQUE_COUNTRY_ALIAS_SUBSET',...base};\n return {id:null,reason:best.score>=0.75?'AMBIGUOUS_CONTEXT_MATCH':'LOW_CONFIDENCE_MATCH',...base};\n}\nasync function __apiFootballH2H(homeName,awayName,hid,aid,ctx={}){\n const pairKey=[Number(hid),Number(aid)].sort((a,b)=>a-b).join(':');\n const cached=await __cachedH2H.call(this,pairKey,homeName,awayName);\n if(cached?.matches_json&&Array.isArray(cached.matches_json))return {rows:cached.matches_json,source:'API_FOOTBALL_CACHE',calls:0,status:'CACHE_HIT',resolver:{home:{id:Number(cached.api_home_team_id),reason:'CACHE'},away:{id:Number(cached.api_away_team_id),reason:'CACHE'},country:__countryFrom(ctx.country,ctx.league)}};\n const before=await __afUsedToday.call(this); if(before>=AF_DAILY_BUDGET)return {rows:[],source:'API_FOOTBALL_SKIPPED',calls:0,status:'DAILY_BUDGET'};\n const hr=await __resolveAfTeam.call(this,homeName,{...ctx,providerTeamId:hid}); if(!hr.id)return {rows:[],source:'API_FOOTBALL_UNRESOLVED',calls:(await __afUsedToday.call(this))-before,status:`HOME_${hr.reason}`,resolver:{home:hr,away:null,country:__countryFrom(ctx.country,ctx.league)}};\n let ar=await __resolveAfTeam.call(this,awayName,{...ctx,providerTeamId:aid});\n if(!ar.id&&hr.id&&Array.isArray(ar.candidates)){\n   const borderline=ar.candidates.filter(x=>x.countryOk&&x.categoryOk&&Number(x.score)>=0.60).slice(0,2);\n   for(const cand of borderline){\n     const vr=await __afGet.call(this,`/fixtures/headtohead?h2h=${Number(hr.id)}-${Number(cand.id)}`);\n     if(!vr.ok){if(vr.reason==='DAILY_BUDGET'||vr.reason==='RATE_LIMIT')break;continue;}\n     const rows=(Array.isArray(vr.body?.response)?vr.body.response:[]).slice().sort((a,b)=>new Date(b?.fixture?.date||0).getTime()-new Date(a?.fixture?.date||0).getTime()).slice(0,3);\n     const verified=rows.some(x=>{\n       const h=Number(x?.teams?.home?.id),a=Number(x?.teams?.away?.id);\n       return (h===Number(hr.id)&&a===Number(cand.id))||(h===Number(cand.id)&&a===Number(hr.id));\n     });\n     if(verified){ar={...ar,id:Number(cand.id),reason:'VERIFIED_BORDERLINE_ALIAS_H2H',confidence:Number(cand.score),matched_name:cand.name,verified_against_api_team_id:Number(hr.id),verification_h2h_rows:rows.length};break;}\n   }\n }\n if(!ar.id)return {rows:[],source:'API_FOOTBALL_UNRESOLVED',calls:(await __afUsedToday.call(this))-before,status:`AWAY_${ar.reason}`,resolver:{home:hr,away:ar,country:__countryFrom(ctx.country,ctx.league)}};\n const homeApi=hr.id,awayApi=ar.id;\n await __saveAfTeam.call(this,hid,homeName,__countryFrom(ctx.country,ctx.league),hr);\n await __saveAfTeam.call(this,aid,awayName,__countryFrom(ctx.country,ctx.league),ar);\n const rr=await __afGet.call(this,`/fixtures/headtohead?h2h=${homeApi}-${awayApi}`);\n if(!rr.ok)return {rows:[],source:'API_FOOTBALL_ERROR',calls:(await __afUsedToday.call(this))-before,status:rr.reason,resolver:{home:hr,away:ar,country:__countryFrom(ctx.country,ctx.league)},api_diagnostic:{endpoint:'/fixtures/headtohead',home_api_team_id:Number(homeApi),away_api_team_id:Number(awayApi),...(rr.diagnostic||{})}};\n const rawAll=Array.isArray(rr.body?.response)?rr.body.response:[];\n const raw=rawAll.slice().sort((a,b)=>new Date(b?.fixture?.date||0).getTime()-new Date(a?.fixture?.date||0).getTime()).slice(0,10);\n const rows=raw.filter(x=>['FT','AET','PEN'].includes(String(x?.fixture?.status?.short||''))).map(x=>{\n   const apiH=Number(x?.teams?.home?.id),apiA=Number(x?.teams?.away?.id);\n   let ph=null,pa=null;\n   if(apiH===Number(homeApi)&&apiA===Number(awayApi)){ph=Number(hid);pa=Number(aid);}\n   else if(apiH===Number(awayApi)&&apiA===Number(homeApi)){ph=Number(aid);pa=Number(hid);}\n   else return null;\n   return {id:x?.fixture?.id??null,kickoff_utc:x?.fixture?.date??null,kickoff_ts:x?.fixture?.timestamp??0,status:'finished',teams:{home:{id:ph,name:x?.teams?.home?.name},away:{id:pa,name:x?.teams?.away?.name}},goals:{home:x?.goals?.home,away:x?.goals?.away},api_football:true};\n }).filter(Boolean).filter(x=>isFin(x?.goals?.home)&&isFin(x?.goals?.away));\n const exp=new Date(Date.now()+30*86400000).toISOString();\n await __saveH2H.call(this,{pair_key:pairKey,provider_home_team_id:Number(hid),provider_away_team_id:Number(aid),home_team_name:homeName,away_team_name:awayName,api_home_team_id:homeApi,api_away_team_id:awayApi,matches_json:rows,h2h_n:rows.length,source:'API_FOOTBALL',fetched_at:new Date().toISOString(),expires_at:exp});\n return {rows,source:'API_FOOTBALL',calls:(await __afUsedToday.call(this))-before,status:'SUCCESS',resolver:{home:hr,away:ar,country:__countryFrom(ctx.country,ctx.league)},api_diagnostic:{endpoint:'/fixtures/headtohead',home_api_team_id:Number(homeApi),away_api_team_id:Number(awayApi),...(rr.diagnostic||{})}};\n}\n\nconst out=[];\nfor(const f0 of fixtures){\n let hid=Number(f0?.home_team_id),aid=Number(f0?.away_team_id);\n let f={\n   id:Number(f0.fixture_id),\n   kickoff_utc:f0.kickoff,\n   status:String(f0.provider_status||'scheduled').toLowerCase(),\n   league:{name:f0.league||null},\n   teams:{\n     home:{id:hid,name:f0.home_team||null},\n     away:{id:aid,name:f0.away_team||null}\n   }\n };\n // Backward-compatible fallback only when discovery input lacks team IDs.\n if(!Number.isFinite(hid)||hid<=0||!Number.isFinite(aid)||aid<=0){\n   const fx=await get.call(this,`/fixtures/${f0.fixture_id}`);\n   await sleep(7500);\n   const full=data(fx);\n   if(!full){\n     out.push({...f0,candidates:[],reject_reason:'FIXTURE_DETAIL_UNAVAILABLE',model_run:modelRunMeta});\n     continue;\n   }\n   f=full;\n   hid=Number(f?.teams?.home?.id); aid=Number(f?.teams?.away?.id);\n }\n const liveStatus=String(f?.status||'').toLowerCase();\n if(!['scheduled','not_started','not started','ns','timed','upcoming'].includes(liveStatus)){\n   out.push({...f0,fixture_id:f?.id||f0.fixture_id,candidates:[],reject_reason:'FIXTURE_NOT_SCHEDULED',provider_status:liveStatus||null,model_run:modelRunMeta});\n   continue;\n }\n if(!Number.isFinite(hid)||hid<=0||!Number.isFinite(aid)||aid<=0){\n   out.push({...f0,fixture_id:f?.id||f0.fixture_id,candidates:[],reject_reason:'TEAM_IDS_UNAVAILABLE',model_run:modelRunMeta});\n   continue;\n }\n const hh=await get.call(this,`/teams/${hid}/fixtures`); await sleep(7500);\n const ah=await get.call(this,`/teams/${aid}/fixtures`); await sleep(7500);\n const venueHomeRows=venueRows(hh,hid,'home',f.id).slice(0,15), venueAwayRows=venueRows(ah,aid,'away',f.id).slice(0,15);\n // v1.3.3 ADAPTIVE HISTORY: preserve venue-specific history when sufficient.\n // If a side has <4 venue rows, fall back only when >=8 finished overall team matches exist.\n // Overall rows are re-oriented to the modeled team's GF/GA perspective; they are NOT treated as true venue rows.\n const perspectiveRows=(arr,teamId,asHome,currentId)=>finished(arr,currentId)\n   .filter(r=>Number(r?.teams?.home?.id)===Number(teamId)||Number(r?.teams?.away?.id)===Number(teamId))\n   .sort((a,b)=>Number(b?.kickoff_ts||0)-Number(a?.kickoff_ts||0))\n   .map(r=>{\n     const teamWasHome=Number(r?.teams?.home?.id)===Number(teamId);\n     const gf=teamWasHome?Number(r.goals.home):Number(r.goals.away);\n     const ga=teamWasHome?Number(r.goals.away):Number(r.goals.home);\n     return {...r,goals:asHome?{home:gf,away:ga}:{home:ga,away:gf},__adaptive_overall:true};\n   });\n const overallHomeRows=perspectiveRows(hh,hid,true,f.id).slice(0,15);\n const overallAwayRows=perspectiveRows(ah,aid,false,f.id).slice(0,15);\n const homeFallback=venueHomeRows.length<4 && overallHomeRows.length>=8;\n const awayFallback=venueAwayRows.length<4 && overallAwayRows.length>=8;\n const homeRows=(venueHomeRows.length>=4?venueHomeRows:(homeFallback?overallHomeRows:venueHomeRows)).slice(0,15);\n const awayRows=(venueAwayRows.length>=4?venueAwayRows:(awayFallback?overallAwayRows:venueAwayRows)).slice(0,15);\n const nH=homeRows.length,nA=awayRows.length;\n const venueNH=venueHomeRows.length,venueNA=venueAwayRows.length;\n const overallNH=overallHomeRows.length,overallNA=overallAwayRows.length;\n const historyMode=(homeFallback||awayFallback)?'HYBRID_OVERALL_FALLBACK':'FULL_VENUE';\n const historyPenalty=historyMode==='HYBRID_OVERALL_FALLBACK'?0.75:1.0;\n\n// v6.34.3 BTTS CONTEXT AUDIT.\n// Research/audit only: these metrics DO NOT alter model probability, EV, gates, score or ranking.\nconst __rate=(rows,fn)=>{\n  const vals=(rows||[]).filter(r=>isFin(r?.goals?.home)&&isFin(r?.goals?.away));\n  if(!vals.length)return null;\n  return vals.filter(fn).length/vals.length;\n};\nconst __weightedBoolRate=(rows,fn)=>{\n  const w=[1,.92,.84,.76,.68,.60,.54,.48,.43,.38,.34,.30,.27,.24,.21];\n  let s=0,z=0;\n  (rows||[]).slice(0,15).forEach((r,i)=>{\n    if(!isFin(r?.goals?.home)||!isFin(r?.goals?.away))return;\n    const ww=w[i]||.2; z+=ww; if(fn(r))s+=ww;\n  });\n  return z?s/z:null;\n};\nlet __h2hRows=finished(hh,f.id)\n  .filter(r=>{\n    const h=Number(r?.teams?.home?.id),a=Number(r?.teams?.away?.id);\n    return (h===hid&&a===aid)||(h===aid&&a===hid);\n  })\n  .sort((a,b)=>Number(b?.kickoff_ts||0)-Number(a?.kickoff_ts||0))\n  .slice(0,8);\n let __h2hSource='5DOLLAR_TEAM_HISTORY', __h2hFallbackStatus='NOT_NEEDED', __h2hFallbackCalls=0, __h2hResolver=null, __h2hApiDiagnostic=null;\n if(__h2hRows.length<5){\n   const fb=await __apiFootballH2H.call(this,f?.teams?.home?.name,f?.teams?.away?.name,hid,aid,{country:f0?.country??f?.country??null,league:f0?.league??f?.league?.name??f?.league??null});\n   __h2hFallbackStatus=fb?.status||'UNKNOWN'; __h2hFallbackCalls=Number(fb?.calls||0); __h2hResolver=fb?.resolver||null; __h2hApiDiagnostic=fb?.api_diagnostic?{endpoint:fb.api_diagnostic.endpoint??null,http_status:fb.api_diagnostic.http_status??null,results:fb.api_diagnostic.results??fb.api_diagnostic.response_count??null,errors:fb.api_diagnostic.errors??null}:null;\n   if(Array.isArray(fb?.rows)&&fb.rows.length>__h2hRows.length){__h2hRows=fb.rows;__h2hSource=fb.source||'API_FOOTBALL';}\n }\n\nconst __bttsContext={\n  home_venue_n:nH,\n  away_venue_n:nA,\n  home_btts_rate:__rate(homeRows,r=>Number(r.goals.home)>0&&Number(r.goals.away)>0),\n  home_btts_rate_weighted:__weightedBoolRate(homeRows,r=>Number(r.goals.home)>0&&Number(r.goals.away)>0),\n  home_clean_sheet_rate:__rate(homeRows,r=>Number(r.goals.away)===0),\n  home_fail_to_score_rate:__rate(homeRows,r=>Number(r.goals.home)===0),\n  away_btts_rate:__rate(awayRows,r=>Number(r.goals.home)>0&&Number(r.goals.away)>0),\n  away_btts_rate_weighted:__weightedBoolRate(awayRows,r=>Number(r.goals.home)>0&&Number(r.goals.away)>0),\n  away_clean_sheet_rate:__rate(awayRows,r=>Number(r.goals.home)===0),\n  away_fail_to_score_rate:__rate(awayRows,r=>Number(r.goals.away)===0),\n  h2h_n:__h2hRows.length,\n  h2h_btts_rate:__rate(__h2hRows,r=>Number(r.goals.home)>0&&Number(r.goals.away)>0),\n  h2h_last2_no_count:__h2hRows.slice(0,2).filter(r=>!(Number(r.goals.home)>0&&Number(r.goals.away)>0)).length,\n  h2h_results:__h2hRows.map(r=>({\n    fixture_id:r.id??null,\n    kickoff:r.kickoff_utc??null,\n    home:r?.teams?.home?.name??null,\n    away:r?.teams?.away?.name??null,\n    score:`${Number(r.goals.home)}:${Number(r.goals.away)}`,\n    btts:Number(r.goals.home)>0&&Number(r.goals.away)>0\n  }))\n};\n\n // v1.5 HISTORY-FIRST: universal H2H context is attached to EVERY candidate market.\n // H2H is only considered publication-grade when >=5 finished direct meetings are available.\n const __h2hContext={\n   h2h_n:__h2hRows.length,\n   h2h_tier:__h2hRows.length>=5?'FULL':(__h2hRows.length>=2?'PARTIAL':'NONE'),\n   h2h_full_weight_min:5,\n   h2h_required_for_publication:false,\n   h2h_source:__h2hSource,\n   h2h_fallback_status:__h2hFallbackStatus,\n   h2h_fallback_calls:__h2hFallbackCalls,\n   h2h_resolver:__h2hResolver,\n   h2h_api_diagnostic:__h2hApiDiagnostic,\n   h2h_results:__h2hRows.map(r=>({\n     fixture_id:r.id??null,kickoff:r.kickoff_utc??null,\n     home_id:Number(r?.teams?.home?.id)||null,away_id:Number(r?.teams?.away?.id)||null,\n     home:r?.teams?.home?.name??null,away:r?.teams?.away?.name??null,\n     home_goals:Number(r.goals.home),away_goals:Number(r.goals.away),\n     total_goals:Number(r.goals.home)+Number(r.goals.away),\n     btts:Number(r.goals.home)>0&&Number(r.goals.away)>0\n   }))\n };\n\n const dq=clamp(Math.min(nH,nA)/15*100*historyPenalty,0,100);\n const histBase=clamp((Math.min(nH,nA)/10)*70 + (Math.min(nH,nA)>=6?30:0),0,100);\n const hist=clamp(histBase*historyPenalty,0,100);\n if(nH<4||nA<4){out.push({...f0,fixture_id:f.id,home_team:f?.teams?.home?.name,away_team:f?.teams?.away?.name,league:f?.league?.name,data_quality_score:dq,history_score:hist,history_home_n:nH,history_away_n:nA,history_mode:'NO_RELIABLE_HISTORY',history_home_venue_n:venueNH,history_away_venue_n:venueNA,history_home_overall_n:overallNH,history_away_overall_n:overallNA,candidates:[],reject_reason:'INSUFFICIENT_HISTORY_AFTER_ADAPTIVE_FALLBACK'});continue}\n const hGF=weightedAvg(homeRows,r=>r.goals.home),hGA=weightedAvg(homeRows,r=>r.goals.away);\n const aGF=weightedAvg(awayRows,r=>r.goals.away),aGA=weightedAvg(awayRows,r=>r.goals.home);\n const lh=clamp((hGF+aGA)/2,.15,4.5),la=clamp((aGF+hGA)/2,.15,4.5);\n const g=grid(lh,la),P=probs(g);\n const ob=await get.call(this,`/fixtures/${f.id}/odds?bookmakers=bet365`); await sleep(7500);\n const __bookmakers=(data(ob)?.bookmakers||[]);\n const bm=__bookmakers.find(x=>String(x.slug||'').toLowerCase()==='bet365')||__bookmakers[0];\n const o=bm?.odds||{},c=[];\n const __oddsKeys=Object.keys(o||{});\n const __supportedOddsKeys=__oddsKeys.filter(k=>['1x2','btts','goal_line','goal_line_half','goalline_half'].includes(String(k).toLowerCase()));\n const __bet365Diag={\n   odds_request_attempted:true,\n   odds_response_received:ob!=null,\n   bookmakers_found:__bookmakers.length,\n   bookmaker_selected:bm?.slug||bm?.name||null,\n   market_keys_found:__oddsKeys,\n   markets_found:__oddsKeys.length,\n   supported_market_keys:__supportedOddsKeys,\n   supported_markets_found:__supportedOddsKeys.length\n };\n const x=o['1x2']||{},xc=x.closing||x.current||{},xo=x.opening||{};\n const dv3=(isFin(xc.home)&&isFin(xc.draw)&&isFin(xc.away))?(()=>{let a=1/xc.home,b=1/xc.draw,d=1/xc.away,z=a+b+d;return [a/z,b/z,d/z]})():[null,null,null];\n add(c,'MONEYLINE','HOME_WIN','HOME',null,xc.home,P.H,dv3[0],xo.home,dq,hist,nH,nA);\n add(c,'MONEYLINE','DRAW','DRAW',null,xc.draw,P.D,dv3[1],xo.draw,dq,hist,nH,nA);\n add(c,'MONEYLINE','AWAY_WIN','AWAY',null,xc.away,P.A,dv3[2],xo.away,dq,hist,nH,nA);\n const bt=o.btts||{},bc=bt.closing||bt.current||{},bo=bt.opening||{},bd=devig2(bc.yes,bc.no);\n add(c,'BTTS','BTTS_YES','YES',null,bc.yes,P.BY,bd?.[0],bo.yes,dq,hist,nH,nA);\n add(c,'BTTS','BTTS_NO','NO',null,bc.no,P.BN,bd?.[1],bo.no,dq,hist,nH,nA);\nfor(const __q of c){\n  if(__q.market_family==='BTTS'){\n    __q.btts_context=__bttsContext;\n    __q.btts_model_inputs={\n      lambda_home:lh,lambda_away:la,\n      raw_btts_yes_probability:P.BY,\n      raw_btts_no_probability:P.BN\n    };\n  }\n}\n\n const gl=o.goal_line||{},gc=gl.closing||gl.current||{},go=gl.opening||{};\n // v6.33.0 MULTI-MARKET GOALS ENGINE.\n // Public families: 1X2 + BTTS + real Bet365 FT Goal Line.\n // Asian Handicap remains OFF. No line conversion, nearest-line fallback or synthetic odds.\n const v633FtGoalMarket=o.goal_line||{},v633FtGoalCurrent=v633FtGoalMarket.closing||v633FtGoalMarket.current||{},v633FtGoalOpening=v633FtGoalMarket.opening||{};\n if(isFin(v633FtGoalCurrent.line)){\n   const v633FtGoalLine=Number(v633FtGoalCurrent.line);\n   const v633FtGoalSupported=v633FtGoalLine>=1.5 && v633FtGoalLine<=3.5 && Math.abs(v633FtGoalLine*4-Math.round(v633FtGoalLine*4))<1e-9;\n   if(v633FtGoalSupported){\n     const v633FtGoalDevig=devig2(v633FtGoalCurrent.over,v633FtGoalCurrent.under);\n     const v633FtOverEV=expectedAsianEV(g,v633FtGoalLine,'OVER',Number(v633FtGoalCurrent.over),'GOALS');\n     const v633FtUnderEV=expectedAsianEV(g,v633FtGoalLine,'UNDER',Number(v633FtGoalCurrent.under),'GOALS');\n     add(c,'GOALS',`OVER_${v633FtGoalLine}`,'OVER',v633FtGoalLine,v633FtGoalCurrent.over,binaryProb(g,v633FtGoalLine,'OVER','GOALS'),v633FtGoalDevig?.[0],v633FtGoalOpening?.over,dq,hist,nH,nA,v633FtOverEV.ev,true,v633FtOverEV);\n     add(c,'GOALS',`UNDER_${v633FtGoalLine}`,'UNDER',v633FtGoalLine,v633FtGoalCurrent.under,binaryProb(g,v633FtGoalLine,'UNDER','GOALS'),v633FtGoalDevig?.[1],v633FtGoalOpening?.under,dq,hist,nH,nA,v633FtUnderEV.ev,true,v633FtUnderEV);\n   }\n }\n\n // Half-time line is captured for research only. Do not derive it from FT lambda.\n // RESEARCH ONLY: record real Bet365 first-half line and both prices when supplied.\n // No probabilities are inferred from full-time lambdas; no publication path.\n const __htMarket=o.goal_line_half||o.goalline_half||null;\n const __htNow=__htMarket?.closing||__htMarket?.current||null;\n const __htOpen=__htMarket?.opening||null;\n const __htResearch={\n   source:'BET365', market_present:!!__htMarket,\n   line:__htNow&&isFin(__htNow.line)?Number(__htNow.line):null,\n   over_odd:__htNow&&isFin(__htNow.over)&&Number(__htNow.over)>1?Number(__htNow.over):null,\n   under_odd:__htNow&&isFin(__htNow.under)&&Number(__htNow.under)>1?Number(__htNow.under):null,\n   opening_over_odd:__htOpen&&isFin(__htOpen.over)&&Number(__htOpen.over)>1?Number(__htOpen.over):null,\n   opening_under_odd:__htOpen&&isFin(__htOpen.under)&&Number(__htOpen.under)>1?Number(__htOpen.under):null,\n   target_lines:[0.5,1.5], probability_model_status:'PENDING_VERIFIED_HT_HISTORY',\n   research_only:true, published:false\n };\n const v633HtGoalMarket=o.goal_line_half||o.goalline_half||null;\n const v633HtGoalCurrent=v633HtGoalMarket?.closing||v633HtGoalMarket?.current||null;\n if(v633HtGoalCurrent && isFin(v633HtGoalCurrent.line)){\n   c.push({market_family:'CAPABILITY_ONLY',market:`HT_GOAL_LINE_${Number(v633HtGoalCurrent.line)}`,side:null,line:Number(v633HtGoalCurrent.line),\n     odds:null,raw_probability:null,market_probability:null,opening_odds:null,dq,history_score:hist,\n     history_home_n:nH,history_away_n:nA,precalculated_ev:null,publicEligible:false,\n     capability:'BET365_GOALLINE_HALF_PRESENT',reason:'RESEARCH_ONLY_NO_INDEPENDENT_HT_MODEL'});\n }\n\n // Asian Handicap stays excluded from candidate generation/publication.\n for(const q of c){\n   q.fixture_id=f.id;q.kickoff=f.kickoff_utc;\n   q.home_team=f.teams.home.name;q.away_team=f.teams.away.name;\n   q.league=f.league?.name||null;q.country=(f?.league?.country??f?.country?.name??f?.country??f0?.country??__countryFrom(null,f?.league?.name)??null);\n   q.minutes_to_kickoff=(Date.parse(f.kickoff_utc)-Date.now())/60000;\n   q.data_quality_score=dq;q.history_score=hist;\n   q.market_score=marketScore(q.model_probability_calibrated,q.market_probability,dq,hist,q.odd,q.calibrated_ev,q.moveAdj,nH,nA);\n   q.lambda_home=lh;q.lambda_away=la;q.history_home_n=nH;q.history_away_n=nA;\n }\n // FUSION ENGINE v1.0 feature layer.\n // Source-derived factors are calculated only when the provider supplies the required data.\n const __avg=(arr,fn)=>arr.length?arr.reduce((s,r)=>s+Number(fn(r)||0),0)/arr.length:null;\n const __h5=homeRows.slice(0,5), __a5=awayRows.slice(0,5);\n const __seasonH=__avg(homeRows,r=>Number(r.goals.home)+Number(r.goals.away));\n const __seasonA=__avg(awayRows,r=>Number(r.goals.home)+Number(r.goals.away));\n const __formH=__avg(__h5,r=>Number(r.goals.home)+Number(r.goals.away));\n const __formA=__avg(__a5,r=>Number(r.goals.home)+Number(r.goals.away));\n const __bp=(isFin(__seasonH)&&isFin(__seasonA))?(__seasonH+__seasonA)/2:null;\n const __fp=(isFin(__formH)&&isFin(__formA))?(__formH+__formA)/2:null;\n const __ipt=(isFin(__bp)&&isFin(__fp))?0.6*__bp+0.4*__fp:null;\n const __homeGF5=__avg(__h5,r=>r.goals.home), __homeGA5=__avg(__h5,r=>r.goals.away);\n const __awayGF5=__avg(__a5,r=>r.goals.away), __awayGA5=__avg(__a5,r=>r.goals.home);\n const __u25=[...__h5,...__a5].filter(r=>(Number(r.goals.home)+Number(r.goals.away))<2.5).length;\n const __x=o['1x2']||{}, __xc=__x.closing||__x.current||{};\n const __feat={\n   season_home_total:__seasonH,season_away_total:__seasonA,\n   form_home_total:__formH,form_away_total:__formA,bp:__bp,fp:__fp,ipt:__ipt,\n   home_gf_last5:__homeGF5,home_ga_last5:__homeGA5,\n   away_gf_last5:__awayGF5,away_ga_last5:__awayGA5,\n   under25_count_last10:__u25,\n   home_odd:isFin(__xc.home)?Number(__xc.home):null,\n   draw_odd:isFin(__xc.draw)?Number(__xc.draw):null,\n   away_odd:isFin(__xc.away)?Number(__xc.away):null,\n   lambda_total:isFin(lh)&&isFin(la)?lh+la:null,\n   history_mode:historyMode,history_penalty:historyPenalty,home_venue_n:venueNH,away_venue_n:venueNA,home_overall_n:overallNH,away_overall_n:overallNA,\n   standings_available:false,injuries_available:false,weather_available:false,\n   h2h_predictive_available:__h2hRows.length>=5,player_tracking_available:false,sentiment_available:false\n };\n for(const q of c){\n   q.fusion_features=__feat;\n   q.history_context={\n     team_history_home_n:nH,team_history_away_n:nA,\n     venue_home_n:venueNH,venue_away_n:venueNA,\n     overall_home_n:overallNH,overall_away_n:overallNA,\n     history_mode:historyMode,history_score:hist,\n     ...__h2hContext\n   };\n }\n const __candidateEmptyReason=c.length?null:(!__bet365Diag.odds_response_received?'BET365_NO_RESPONSE':(!__bet365Diag.bookmakers_found?'BET365_NO_BOOKMAKER':(!__bet365Diag.supported_markets_found?'NO_SUPPORTED_MARKETS':'NO_VALID_CANDIDATES')));\n out.push({fixture_id:f.id,kickoff:f.kickoff_utc,home_team:f.teams.home.name,away_team:f.teams.away.name,league:f.league?.name||null,country:(f?.league?.country??f?.country?.name??f?.country??f0?.country??__countryFrom(null,f?.league?.name)??null),provider_status:f.status,data_quality_score:dq,history_score:hist,history_home_n:nH,history_away_n:nA,history_mode:historyMode,history_penalty:historyPenalty,history_home_venue_n:venueNH,history_away_venue_n:venueNA,history_home_overall_n:overallNH,history_away_overall_n:overallNA,lambda_home:lh,lambda_away:la,fusion_features:__feat,market_policy:'FUSION_MULTI_MARKET',goal_line_min:1.5,goal_line_max:3.5,goal_line_step:0.25,asian_handicap_enabled:false,half_time_market_research:true,ht_research:__htResearch,model_run:modelRunMeta,bet365_diagnostics:{...__bet365Diag,candidates_created:c.length,candidate_empty_reason:__candidateEmptyReason},candidates:c});\n}\nconst __discoveryMeta={fixtures_fetched:Number(inp.fixturesFetched||0),fixtures_in_watch_window:Number(inp.fixturesInWatchWindow||allFixtures.length||0),discovery_mode:inp.discoveryMode||null,discovery_error:inp.discoveryError||null,earliest_upcoming_minutes:inp.earliestUpcomingMinutes??null,reject_counts:inp.rejectCounts||{}};\nreturn out.map(json=>({json:{...json,engineVersion:'FUSION_ENGINE_V1_5_3_18_PRODUCTION_CLEANUP',discovery_meta:__discoveryMeta,bet365_diagnostics:json.bet365_diagnostics||{odds_request_attempted:false,odds_response_received:null,bookmakers_found:0,markets_found:0,supported_markets_found:0,candidates_created:Array.isArray(json.candidates)?json.candidates.length:0,candidate_empty_reason:json.reject_reason||((Array.isArray(json.candidates)&&json.candidates.length===0)?'NO_CANDIDATES_BEFORE_ODDS':null)}}}));"
+      },
+      "id": "8962bdd7-124e-4a15-8efa-07742481cc6f",
+      "name": "02 · TRUE Independent History + Model + Bet365",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -656,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const src=$json||{};\nconst raw=Array.isArray(src.candidates)?src.candidates:[];\nconst out=[],seen=new Set();\nlet invalid=0,duplicate=0;\nconst rejectedDetail=[];\n\nfor(const c0 of raw){\n  const c={...c0};\n  const odd=Number(c.current_odd??c.odd);\n  const t=Number(c.minutes_to_kickoff ??\n    ((Date.parse(c.kickoff||src.kickoff)-Date.now())/60000));\n\n  if(!Number.isFinite(odd)||odd<=1||!Number.isFinite(t)){\n    invalid++;\n    rejectedDetail.push({reason:'INVALID',market_family:c.market_family??null,market_key:c.market_key??null,side:c.side??null,line:c.line??null,odd:Number.isFinite(odd)?odd:null,minutes_to_kickoff:Number.isFinite(t)?t:null});\n    continue;\n  }\n\n  c.current_odd=odd;\n  c.odd=odd;\n  c.minutes_to_kickoff=t;\n  c.fixture_id=c.fixture_id??src.fixture_id;\n  c.kickoff=c.kickoff??src.kickoff;\n  c.home_team=c.home_team??src.home_team;\n  c.away_team=c.away_team??src.away_team;\n  c.league=c.league??src.league;\n  c.country=c.country??src.country;\n\n  const key=[\n    c.fixture_id,c.market_family,c.market_key,c.side,c.line??'NULL',odd\n  ].join('|');\n\n  if(seen.has(key)){duplicate++;rejectedDetail.push({reason:'DUPLICATE',market_family:c.market_family??null,market_key:c.market_key??null,side:c.side??null,line:c.line??null,odd});continue;}\n  seen.add(key);\n  out.push(c);\n}\n\nreturn {\n    ...src,\n    engineVersion:'FUSION_ENGINE_V1_5_3_18_PRODUCTION_CLEANUP',\n    candidates:out,\n    marketsNormalized:out.length,\n    normalizationInput:raw.length,\n    normalizationRejected:{INVALID:invalid,DUPLICATE:duplicate},\n    normalization_rejected_detail:rejectedDetail\n};"
+      },
+      "id": "37faf4e3-91e2-43e6-877a-2e8fefe32158",
+      "name": "02 · Normalize Real Bet365 Markets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -320,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const src=$json||{};\nconst a=Array.isArray(src.candidates)?src.candidates:[];\nconst pass=[]; const rejected={OUTSIDE_WINDOW:0,INVALID_TMINUS:0};\nfor(const c of a){\n const m=Number(c.minutes_to_kickoff ?? src.minutes_to_kickoff ??\n   ((Date.parse(c.kickoff||src.kickoff)-Date.now())/60000));\n if(!Number.isFinite(m)){rejected.INVALID_TMINUS++;continue;}\n if(m<20||m>90){rejected.OUTSIDE_WINDOW++;continue;}\n pass.push({...c,minutes_to_kickoff:m});\n}\nreturn {...src,engineVersion:'FUSION_ENGINE_V1_5_3_18_PRODUCTION_CLEANUP',\n marketsNormalized:a.length,t30Input:a.length,t30Passed:pass.length,t30Rejected:rejected,candidates:pass};"
+      },
+      "id": "6bd874b5-f6dd-4b74-8cf0-2a6c8a689ade",
+      "name": "03 · T-30 Time Window Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -16,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const src=$json||{},a=Array.isArray(src.candidates)?src.candidates:[];\nconst pass=[],rejected={INVALID_ODD:0,OUTSIDE_RANGE:0,UNSUPPORTED_FAMILY:0};\nfunction range(fam){\n if(fam==='DOUBLE_CHANCE') return [1.45,1.90];\n if(fam==='MONEYLINE') return [1.55,2.20];\n if(fam==='BTTS') return [1.50,2.20];\n if(fam==='GOALS') return [1.50,2.20];\n return null;\n}\nfor(const c of a){\n const fam=String(c.market_family||'').toUpperCase();\n const r=range(fam);\n if(!r){rejected.UNSUPPORTED_FAMILY++;continue;}\n const o=Number(c.current_odd??c.odd);\n if(!Number.isFinite(o)||o<=1){rejected.INVALID_ODD++;continue;}\n if(o<r[0]||o>r[1]){rejected.OUTSIDE_RANGE++;continue;}\n pass.push({...c,current_odd:o,odd:o});\n}\nreturn {...src,engineVersion:'FUSION_ENGINE_V1_5_3_18_PRODUCTION_CLEANUP',\n oddsInput:a.length,oddsPassed:pass.length,oddsRejected:rejected,candidates:pass};"
+      },
+      "id": "970ccd81-f2a9-461f-a09f-2692e6912577",
+      "name": "04 · Odds Range Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        288,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const src=$json||{},a=Array.isArray(src.candidates)?src.candidates:[];\nconst pass=[];\nconst rejected={\n NOT_PUBLIC:0,UNSUPPORTED_LINE:0,ODDS_RANGE:0,\n PROBABILITY:0,EXTREME_EV:0,LOW_MODEL_WEIGHT:0,MISSING_FIELDS:0\n};\nconst audit=[];\nfunction range(fam){\n if(fam==='DOUBLE_CHANCE') return [1.45,1.90];\n if(fam==='MONEYLINE') return [1.55,2.20];\n if(fam==='BTTS') return [1.50,2.20];\n if(fam==='GOALS') return [1.50,2.20];\n return null;\n}\nfor(const c0 of a){\n const c={...c0};\n const fam=String(c.market_family||'').toUpperCase();\n let reason='PASS';\n\n if(!range(fam)){reason='NOT_PUBLIC';}\n else if(fam==='GOALS'){\n   const L=Number(c.line);\n   if(!(Number.isFinite(L)&&L>=1.5&&L<=3.5&&Math.abs(L*4-Math.round(L*4))<1e-9))\n     reason='UNSUPPORTED_LINE';\n }\n if(reason==='PASS'){\n   const publicFlag=(c.public_eligible===true || c.publicEligible===true);\n   if(!publicFlag) reason='NOT_PUBLIC';\n }\n const odds=Number(c.current_odd??c.odd);\n const p=Number(c.model_probability_calibrated);\n const ev=Number(c.calibrated_ev);\n const mw=Number(c.model_weight);\n\n if(reason==='PASS'){\n   if(!Number.isFinite(odds)||!Number.isFinite(p)||!Number.isFinite(ev)||!Number.isFinite(mw))\n     reason='MISSING_FIELDS';\n }\n if(reason==='PASS'){\n   const r=range(fam);\n   if(odds<r[0]||odds>r[1]) reason='ODDS_RANGE';\n   else if(p<=0.05||p>=0.85) reason='PROBABILITY';\n   else if(Math.abs(ev)>0.18) reason='EXTREME_EV';\n   else if(mw<0.20) reason='LOW_MODEL_WEIGHT';\n }\n if(reason==='PASS') pass.push({...c,odd:odds,current_odd:odds});\n else rejected[reason]=(rejected[reason]||0)+1;\n\n audit.push({\n   market_family:fam,market_key:c.market_key??null,line:c.line??null,odd:Number.isFinite(odds)?odds:null,\n   public_eligible:c.public_eligible??c.publicEligible??null,\n   p:Number.isFinite(p)?p:null,ev:Number.isFinite(ev)?ev:null,\n   model_weight:Number.isFinite(mw)?mw:null,decision:reason\n });\n}\nreturn {...src,engineVersion:'FUSION_ENGINE_V1_5_3_18_PRODUCTION_CLEANUP',\n calibrationInput:a.length,calibrationPassed:pass.length,\n calibrationRejected:rejected,calibrationAudit:audit,candidates:pass};"
+      },
+      "id": "d806c9c6-fed8-4320-9a57-619397a9dcd4",
+      "name": "05 · Probability + Calibration Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        592,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst out=[];\nconst finite=x=>Number.isFinite(Number(x));\n\nfor(const it of items){\n const x=it.json||{};\n const arr=Array.isArray(x.candidates)?x.candidates:[];\n const pass=[];\n const rej={INVALID:0,FUSION_SCORE:0,PRICE:0,EV:0,EDGE:0,MODEL_WEIGHT:0};\n\n for(const q0 of arr){\n   const q={...q0};\n   const fam=String(q.market_family||'').toUpperCase();\n   const odd=Number(q.current_odd??q.odd);\n   const fs=Number(q.fusion_score);\n   const ev=Number(q.calibrated_ev);\n   const edge=Number(q.calibrated_edge_pp);\n   const mw=Number(q.model_weight);\n\n   if(!finite(odd)||odd<=1||!finite(fs)||!finite(ev)||!finite(edge)||!finite(mw)){\n     rej.INVALID++; continue;\n   }\n   if(q.fusion_passed!==true){rej.FUSION_SCORE++;continue;}\n\n   // Keep the production price band conservative. No historical threshold fitting.\n   if(odd<1.60||odd>2.25){rej.PRICE++;continue;}\n   if(mw<0.20){rej.MODEL_WEIGHT++;continue;}\n\n   // v1.4.2 independent value gate.\n   // Do NOT manufacture a probability from Fusion Score and then calculate EV from it.\n   // GOALS calibrated_ev already contains settlement-aware Asian/quarter-line mathematics.\n   // BTTS calibrated_ev is based on the calibrated binary probability.\n   const minEv = fam==='GOALS' ? 0.04 : 0.035;\n   const minEdge = fam==='GOALS' ? 0.020 : 0.020;\n   if(ev<minEv){rej.EV++;continue;}\n   if(edge<minEdge){rej.EDGE++;continue;}\n\n   // Preserve names used by downstream diagnostics/persistence, but values are now independent.\n   const fusionProbability=finite(q.model_probability_calibrated)\n     ? Number(q.model_probability_calibrated)\n     : (finite(q.model_probability)?Number(q.model_probability):null);\n\n   pass.push({...q,\n     fusion_probability:fusionProbability,\n     fusion_ev:ev,\n     fusion_edge_pp:edge,\n     value_method:'INDEPENDENT_CALIBRATED_V1_4_0',\n     legacy_calibrated_ev:q.calibrated_ev??null,\n     legacy_calibrated_edge_pp:q.calibrated_edge_pp??null\n   });\n }\n out.push({json:{...x,candidates:pass,\n   fusionValueInput:arr.length,fusionValuePassed:pass.length,fusionValueRejected:rej,\n   fusionValueMethod:'INDEPENDENT_CALIBRATED_V1_4_0'}});\n}\nreturn out;\n"
+      },
+      "id": "2dac16e1-a020-4508-bf01-f22f52f39306",
+      "name": "06 · FUSION Value + Price Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2480,
+        1888
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const src=$json||{},a=Array.isArray(src.candidates)?src.candidates:[];\nconst pass=[],rejected={DQ:0,HISTORY:0,SAMPLE:0};\nfor(const c of a){\n const dq=Number(c.data_quality_score),h=Number(c.history_score);\n const nh=Number(c.history_home_n),na=Number(c.history_away_n);\n // v1.5.1: primary team history is mandatory; H2H is graded evidence, not a hard gate.\n if(!Number.isFinite(nh)||!Number.isFinite(na)||nh<10||na<10){rejected.SAMPLE++;continue;}\n if(!Number.isFinite(dq)||dq<65){rejected.DQ++;continue;}\n if(!Number.isFinite(h)||h<60){rejected.HISTORY++;continue;}\n const hn=Number(c?.h2h_context?.h2h_n ?? c?.btts_context?.h2h_n ?? 0);\n const tier=hn>=5?'FULL':hn>=2?'PARTIAL':'NONE';\n pass.push({...c,h2h_evidence_tier:tier,h2h_evidence_weight:tier==='FULL'?1:tier==='PARTIAL'?0.4:0});\n}\nreturn { ...src,qualityInput:a.length,qualityPassed:pass.length,qualityRejected:rejected,candidates:pass };"
+      },
+      "id": "9b74170e-49fc-4d1f-8fb0-4ce0673f4702",
+      "name": "07 · Data Quality + History Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst out=[];\nconst finite=x=>Number.isFinite(Number(x));\nconst clamp=(x,a,b)=>Math.max(a,Math.min(b,x));\n\nfor(const it of items){\n const x=it.json||{};\n const arr=Array.isArray(x.candidates)?x.candidates:[];\n const pass=[], rej={LOW_FINAL_SCORE:0,INVALID:0};\n for(const q of arr){\n   if(!finite(q.fusion_score)||!finite(q.fusion_ev)||!finite(q.odd)){rej.INVALID++;continue;}\n   const dq=finite(x.data_quality_score)?Number(x.data_quality_score):0;\n   const hs=finite(x.history_score)?Number(x.history_score):0;\n   const movement=String(q.movement_class||'').toUpperCase();\n   const movementScore=movement==='CONFIRMED'?80:movement==='NEUTRAL'?60:50;\n   const evScore=clamp(50+Number(q.fusion_ev)*250,0,100);\n   const finalScore=\n      0.55*Number(q.fusion_score)+\n      0.15*dq+\n      0.10*hs+\n      0.10*movementScore+\n      0.10*evScore;\n   const z={...q,pre_fusion_market_score:q.pre_fusion_market_score??null,\n     market_score:finalScore,post_fusion_rank_score:finalScore};\n   if(finalScore<63){rej.LOW_FINAL_SCORE++;continue;}\n   pass.push(z);\n }\n out.push({json:{...x,candidates:pass,\n   marketScoreInput:arr.length,marketScorePassed:pass.length,marketScoreRejected:rej}});\n}\nreturn out;\n"
+      },
+      "id": "f5376d20-eda0-48c2-aab4-29c39d838482",
+      "name": "08 · POST-FUSION Rank Quality",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        1888
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const src=$json||{},a=Array.isArray(src.candidates)?src.candidates:[];\nconst pass=[],rejected={AGAINST:0,UNKNOWN:0};\nfor(const c of a){\n // Strong adverse movement is confirmation against the pick, but neutral/unknown is not auto-rejected.\n if(c.movement_class==='AGAINST' && Number(c.opening_to_current_pct)<=-5){rejected.AGAINST++;continue;}\n pass.push(c);\n}\nreturn {...src,movementInput:a.length,movementPassed:pass.length,\n movementRejected:rejected,candidates:pass};"
+      },
+      "id": "3b689115-2cd6-4db8-9c95-5dc2f6a26ec9",
+      "name": "09 · Market Movement Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1792,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const src=$json||{},a=Array.isArray(src.candidates)?src.candidates:[];\nconst sorted=[...a].sort((x,y)=>Number(y.market_score||0)-Number(x.market_score||0)||Number(y.fusion_ev??y.calibrated_ev??0)-Number(x.fusion_ev??x.calibrated_ev??0));\nconst ranked=sorted.map((c,i)=>({...c,fixture_market_rank:i+1,same_fixture_exposure:sorted.length>1,same_fixture_market_count:sorted.length}));\nreturn {...src,rankingInput:a.length,bestMarkets:ranked.length,rankingSeparated:true,crossMarketPolicy:'ALL_INDEPENDENTLY_QUALIFIED',candidates:ranked};"
+      },
+      "id": "a6bbc7a6-fcc2-4417-beff-fc9755683877",
+      "name": "10 · Cross-Market Quality Pass-Through",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2096,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const src=$json||{},a=Array.isArray(src.candidates)?src.candidates:[];\nconst seen=new Set(),pass=[]; let dup=0;\nfor(const c of a){\n const k=[c.fixture_id,c.market_family,c.market_key,c.side,c.line??'NULL'].join('|');\n if(seen.has(k)){dup++;continue;} seen.add(k);pass.push(c);\n}\nreturn {...src,dedupInput:a.length,dedupPassed:pass.length,dedupRejected:dup,candidates:pass};"
+      },
+      "id": "c2191ea9-c5ab-48ed-9255-1ae031fff936",
+      "name": "11 · Exact Signal Deduplication",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const src=$json||{};const candidates=Array.isArray(src.candidates)?src.candidates:[];\nconst SUPABASE_URL=$env.SUPABASE_URL||'https://nhgqksizfyumdqmuuznx.supabase.co';const SUPABASE_KEY=$env.SUPABASE_SERVICE_KEY||'SET_SUPABASE_SECRET_IN_N8N_ENV';\nif(!candidates.length)return {...src,dedupInput:0,dedupPassed:0,duplicatesRejected:0,candidates:[]};\nconst ids=[...new Set(candidates.map(c=>Number(c.fixture_id)).filter(x=>Number.isFinite(x)&&x>0))];if(!ids.length)return {...src,dedupInput:candidates.length,dedupPassed:0,duplicatesRejected:candidates.length,candidates:[],dedupError:'NO_VALID_FIXTURE_IDS'};\nconst base=SUPABASE_URL.replace(/\\/$/,'');const headers={apikey:SUPABASE_KEY,Authorization:`Bearer ${SUPABASE_KEY}`};\nconst url=`${base}/rest/v1/sr_fusion_engine_picks?fixture_id=in.(${ids.join(',')})&or=(publication_status.in.(RESERVED,PUBLISHED),telegram_message_id.not.is.null)&select=fixture_id,market_family,market_key,side,line,publication_status,telegram_message_id`;\nconst r=await this.helpers.httpRequest({method:'GET',url,headers,json:true,returnFullResponse:true,ignoreHttpStatusErrors:true,timeout:15000});const sc=Number(r?.statusCode||0);\nif(sc<200||sc>=300)return {...src,dedupInput:candidates.length,dedupPassed:0,duplicatesRejected:0,candidates:[],dedupError:`DB_GUARD_HTTP_${sc}`,dedupFailClosed:true};\nconst key=x=>[x.fixture_id,String(x.market_family||''),String(x.market_key||''),String(x.side||''),x.line==null?'NULL':Number(x.line)].join('|');const existing=new Set((Array.isArray(r.body)?r.body:[]).map(key));const local=new Set(),pass=[];let dup=0;\nfor(const c of candidates){const k=key(c);if(existing.has(k)||local.has(k)){dup++;continue;}local.add(k);pass.push(c);}return {...src,dedupInput:candidates.length,dedupPassed:pass.length,duplicatesRejected:dup,dedupFailClosed:false,publicationPolicy:'ALL_QUALIFIED_UNLIMITED',candidates:pass};"
+      },
+      "id": "0fcabd04-ba39-48ff-94c6-f2393a4dfb48",
+      "name": "12 · Exact Publication Duplicate Guard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2688,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function __processFixture(__src){\nconst src=__src||{},a=Array.isArray(src.candidates)?src.candidates:[];const bd=src.bet365_diagnostics||{};\nconst diagnostics={discovery:src.discovery_meta||{},bet365:bd,marketsNormalized:Number(src.marketsNormalized||0),normalizationRejected:src.normalizationRejected||{},normalization_rejected_detail:src.normalization_rejected_detail||[],t30Passed:Number(src.t30Passed||0),oddsPassed:Number(src.oddsPassed||0),calibrationPassed:Number(src.calibrationPassed||0),qualityPassed:Number(src.qualityPassed||0),fusionValueInput:Number(src.fusionValueInput||0),fusionValuePassed:Number(src.fusionValuePassed||0),movementPassed:Number(src.movementPassed||0),fusionInput:Number(src.fusionInput||0),fusionPassed:Number(src.fusionPassed||0),bestMarkets:Number(src.bestMarkets||0),dedupPassed:Number(src.dedupPassed||0),dedupRejected:Number(src.dedupRejected||src.duplicatesRejected||0),publicationPolicy:'ALL_QUALIFIED_UNLIMITED'};\nfunction reason(){if(src.reject_reason)return String(src.reject_reason);if(Number(bd.candidates_created||0)===0&&bd.candidate_empty_reason)return String(bd.candidate_empty_reason);if(!diagnostics.marketsNormalized)return 'NO_NORMALIZED_MARKETS';if(!diagnostics.t30Passed)return 'OUTSIDE_T30_WINDOW';if(!diagnostics.oddsPassed)return 'ODDS_GATE_REJECTED';if(!diagnostics.calibrationPassed)return 'CALIBRATION_REJECTED';if(!diagnostics.qualityPassed)return 'DATA_QUALITY_REJECTED';if(diagnostics.fusionInput>0&&!diagnostics.fusionPassed)return 'LOW_FUSION_SCORE';if(diagnostics.fusionValueInput>0&&!diagnostics.fusionValuePassed)return 'FUSION_VALUE_REJECTED';if(Number(src.movementInput||0)>0&&!diagnostics.movementPassed)return 'MOVEMENT_AGAINST';if(Number(src.dedupInput||0)>0&&!diagnostics.dedupPassed)return src.dedupError||'EXACT_DUPLICATE_OR_DB_GUARD';return 'NO_QUALIFYING_SIGNAL'}\nconst base={engineVersion:'FUSION_ENGINE_V1_5_3_18_PRODUCTION_CLEANUP',fixture_id:src.fixture_id??null,kickoff:src.kickoff??null,home_team:src.home_team??null,away_team:src.away_team??null,league:src.league??null,data_quality_score:Number(src.data_quality_score||0),history_score:Number(src.history_score||0),history_home_n:Number(src.history_home_n||0),history_away_n:Number(src.history_away_n||0),history_mode:src.history_mode??null,diagnostics};\nif(!a.length)return [{json:{...base,publish:false,reason:reason()}}];\nreturn a.map((c,i)=>({json:{...base,fixture_id:c.fixture_id??base.fixture_id,kickoff:c.kickoff??base.kickoff,home_team:c.home_team??base.home_team,away_team:c.away_team??base.away_team,league:c.league??base.league,publish:true,reason:'FUSION_V1_5_3_SMART_H2H_RESOLVER_SIGNAL',candidate:c,selected:c,signalIndex:i+1,signalsFromFixture:a.length,sameFixtureExposure:a.length>1}}));\n}\nconst __out=[];\nfor(const __it of $input.all()){ __out.push(...__processFixture(__it.json||{})); }\nreturn __out;"
+      },
+      "id": "e02732bc-4f43-4f84-9b2f-c78884729f7c",
+      "name": "13 · Build Final T-30 Signal + Diagnostics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2992,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "63795406-dabf-413f-8752-6cf7c8849817",
+              "leftValue": "={{ $json.publish }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "36b4c354-5605-467c-b895-9a72067a7a20",
+      "name": "14 · IF Final Signal?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3296,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst SUPABASE_URL = $env.SUPABASE_URL || 'https://nhgqksizfyumdqmuuznx.supabase.co';\nconst SUPABASE_KEY = $env.SUPABASE_SERVICE_KEY || 'SET_SUPABASE_SECRET_IN_N8N_ENV';\n\nconst rows = $input.all().map(i => i.json).filter(x => x && x.publish === true);\nif (!rows.length) return [{json:{publish:false,reason:'NO_PICK_TO_PERSIST'}}];\n\nasync function sbPost(table, body) {\n  const url = `${SUPABASE_URL}/rest/v1/${table}`;\n  const key = (typeof SUPABASE_SERVICE_KEY !== 'undefined' ? SUPABASE_SERVICE_KEY : SUPABASE_KEY);\n  const res = await this.helpers.httpRequest({\n    method:'POST',\n    url,\n    headers:{\n      apikey:key,\n      Authorization:`Bearer ${key}`,\n      'Content-Type':'application/json',\n      Prefer:'return=representation'\n    },\n    body,\n    json:true,\n    returnFullResponse:true,\n    ignoreHttpStatusErrors:true\n  });\n  const status=Number(res.statusCode||0);\n  if (status < 200 || status >= 300) {\n    const body=res.body||{};\n    const pgCode=String(body?.code||'');\n    const msg=String(body?.message||body?.details||'');\n    // PostgreSQL UNIQUE violation / PostgREST conflict. This is an expected\n    // race-safe duplicate skip, not a workflow failure.\n    if (status===409 || pgCode==='23505' || /duplicate key|unique constraint/i.test(msg)) {\n      return {__duplicate_skip:true,status,code:pgCode||null,message:msg||null};\n    }\n    throw new Error(`FUSION_V1_PICK_RESERVATION_FAILED status=${status} body=${JSON.stringify(res.body).slice(0,500)}`);\n  }\n  return res.body;\n}\n\nconst out=[];\nfor (const x of rows) {\n  const c=x.candidate||x.selected||{};\n  const fid=Number(c.fixture_id ?? x.fixture_id);\n  if(!Number.isFinite(fid)||fid<=0) throw new Error('FUSION_V1_PICK_RESERVATION_BLOCKED_MISSING_FIXTURE_ID');\n  const record={\n    engine_version:'FUSION_ENGINE_V1_5_3_18_PRODUCTION_CLEANUP',\n    fusion_score:c.fusion_score==null?null:Number(c.fusion_score),\n    fusion_probability:c.fusion_probability==null?null:Number(c.fusion_probability),\n    fusion_ev:c.fusion_ev==null?null:Number(c.fusion_ev),\n    fusion_edge_pp:c.fusion_edge_pp==null?null:Number(c.fusion_edge_pp),\n    fusion_source_count:c.fusion_source_count==null?null:Number(c.fusion_source_count),\n    fusion_components:c.fusion_components||null,\n    fusion_missing_inputs:c.fusion_missing_inputs||null,\n    pre_fusion_market_score:c.pre_fusion_market_score==null?null:Number(c.pre_fusion_market_score),\n    fixture_id:fid,\n    kickoff:c.kickoff||x.kickoff||null,\n    home_team:c.home_team||x.home_team||null,\n    away_team:c.away_team||x.away_team||null,\n    country:c.country||null,\n    league:c.league||x.league||null,\n    market_family:c.market_family||null,\n    market_key:c.market_key||null,\n    side:c.side||null,\n    line:c.line==null?null:Number(c.line),\n    odd:Number(c.current_odd),\n    stake:100,\n    model_probability:c.model_probability_calibrated==null?null:Number(c.model_probability_calibrated),\n    calibrated_ev:c.calibrated_ev==null?null:Number(c.calibrated_ev),\n    calibrated_edge_pp:c.calibrated_edge_pp==null?null:Number(c.calibrated_edge_pp),\n    market_score:c.market_score==null?null:Number(c.market_score),\n    raw_model_probability:c.model_probability==null?null:Number(c.model_probability),\n    market_probability:c.market_probability==null?null:Number(c.market_probability),\n    model_weight:c.model_weight==null?null:Number(c.model_weight),\n    lambda_home:c.lambda_home==null?null:Number(c.lambda_home),\n    lambda_away:c.lambda_away==null?null:Number(c.lambda_away),\n    btts_context:c.market_family==='BTTS'?(c.btts_context||null):null,\n    asian_settlement_profile:c.market_family==='GOALS'?(c.asian_settlement_profile||null):null,\n    settlement_shadow_score:c.market_family==='GOALS'&&c.settlement_shadow_score!=null?Number(c.settlement_shadow_score):null,\n\n    movement_class:c.movement_class||null,\n    scout_odd:c.scout_odd==null?null:Number(c.scout_odd),\n    opening_odd:c.opening_odd==null?null:Number(c.opening_odd),\n    telegram_chat_id:'-1003038027412',\n    settlement_status:'PENDING_PUBLICATION',\n    publication_status:'RESERVED',\n    publication_reserved_at:new Date().toISOString()\n  };\n  const saved=await sbPost.call(this,'sr_fusion_engine_picks',record);\n  if (saved && saved.__duplicate_skip === true) {\n    // Emit no item downstream: prevents an empty/duplicate Telegram publish.\n    // The UNIQUE index in Supabase is the authoritative final race-condition guard.\n    continue;\n  }\n  const dbRow=Array.isArray(saved)?saved[0]:saved;\n  out.push({json:{...x,dbPersisted:true,dbRow,pick_id:Number(dbRow?.id),supabase_url:SUPABASE_URL,supabase_key:SUPABASE_KEY}});\n}\nreturn out;\n"
+      },
+      "id": "541a0ab7-3ca3-4fa2-b316-15675fd53931",
+      "name": "20 · Persist T-30 Pick",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3872,
+        1888
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "-1003038027412",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "f0861c87-c5be-40d8-b353-d082dfc7aaa3",
+      "name": "21 · Telegram Publish T-30",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        4176,
+        1888
+      ],
+      "webhookId": "cc438a0b-4011-4f8c-b1f7-ffec6f39c06a",
+      "credentials": {
+        "telegramApi": {
+          "id": "HRAZxfaNbMK1280u",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// v6.29.3 FINAL FIXTURE STATUS RECHECK — FAIL CLOSED\n// Uses the same provider configuration as the working loader.\nconst API_BASE = $env.SR626_PROVIDER_API_BASE || 'https://api.5dollarfootballapi.com/v1';\nconst API_KEY = $env.SR626_PROVIDER_API_KEY || 'SET_SR626_PROVIDER_API_KEY_IN_N8N_ENV';\n\nconst src=$json||{};\nif(src.publish!==true) return {...src,statusRecheckPassed:false,statusRecheckReason:'NO_FINAL_SIGNAL'};\nconst c=src.candidate||src.selected||{};\nconst fid=Number(c.fixture_id||src.fixture_id);\nif(!fid) return {...src,statusRecheckPassed:false,statusRecheckReason:'MISSING_FIXTURE_ID'};\n\nconst sleep=ms=>new Promise(r=>setTimeout(r,ms));\nconst pacer=$getWorkflowStaticData('global');\nasync function pacedGet(path){\n  const minGap=6700; // shared provider ceiling ~9/min\n  const now=Date.now(), last=Number(pacer.lastProviderCallAtMs||0);\n  if(last&&now-last<minGap) await sleep(minGap-(now-last));\n  let lastErr=null;\n  for(let attempt=0;attempt<3;attempt++){\n    try{\n      pacer.lastProviderCallAtMs=Date.now();\n      const r=await this.helpers.httpRequest({method:'GET',url:API_BASE+path,headers:{'X-API-Key':API_KEY,'x-api-key':API_KEY,Authorization:'Bearer '+API_KEY,Accept:'application/json'},json:true,timeout:30000,returnFullResponse:true,ignoreHttpStatusErrors:true});\n      const sc=Number(r.statusCode||0);\n      if(sc>=200&&sc<300) return r.body;\n      if(![408,429,500,502,503,504].includes(sc)) throw new Error('HTTP_'+sc);\n      lastErr=new Error('HTTP_'+sc);\n    }catch(e){lastErr=e;}\n    if(attempt<2) await sleep(attempt===0?8000:12000);\n  }\n  throw lastErr||new Error('PROVIDER_STATUS_RECHECK_FAILED');\n}\nfunction unwrap(x){\n  if(!x)return null;\n  if(x.data?.fixture)return x.data.fixture;\n  if(x.fixture)return x.fixture;\n  if(Array.isArray(x.data))return x.data[0]||null;\n  if(Array.isArray(x.response))return x.response[0]||null;\n  if(Array.isArray(x))return x[0]||null;\n  return x.data||x;\n}\nfunction val(o,paths){for(const p of paths){let z=o;for(const k of p.split('.'))z=z?.[k];if(z!==undefined&&z!==null&&z!=='')return z;}return null;}\ntry{\n  const body=await pacedGet.call(this,'/fixtures/'+fid);\n  const f=unwrap(body);\n  if(!f)return {...src,statusRecheckPassed:false,statusRecheckReason:'FIXTURE_NOT_FOUND'};\n  const rawStatus=val(f,['status.short','status.code','status.name','fixture.status.short','fixture.status.code','fixture.status.name','state','fixture_status','status']);\n  const status=String(rawStatus||'').trim().toUpperCase();\n  const allowed=new Set(['NS','SCHEDULED','NOT_STARTED','NOT STARTED','TIMED','UPCOMING']);\n  if(!allowed.has(status))return {...src,statusRecheckPassed:false,statusRecheckReason:'STATUS_'+(status||'UNKNOWN'),providerFixtureStatus:status||null};\n  const ph=String(val(f,['teams.home.name','home_team.name','home.name'])||'').trim().toLowerCase();\n  const pa=String(val(f,['teams.away.name','away_team.name','away.name'])||'').trim().toLowerCase();\n  const eh=String(c.home_team||'').trim().toLowerCase(), ea=String(c.away_team||'').trim().toLowerCase();\n  if((eh&&ph&&eh!==ph)||(ea&&pa&&ea!==pa))\n    return {...src,statusRecheckPassed:false,statusRecheckReason:'FIXTURE_IDENTITY_MISMATCH'};\n  const ko=val(f,['kickoff_utc','date','kickoff','start_time','fixture.date','fixture.kickoff'])||c.kickoff;\n  const koMs=Date.parse(ko||'');\n  if(!Number.isFinite(koMs)||koMs<=Date.now())return {...src,statusRecheckPassed:false,statusRecheckReason:'KICKOFF_NOT_FUTURE',providerFixtureStatus:status};\n  const mins=(koMs-Date.now())/60000;\n  if(mins<20||mins>90)return {...src,statusRecheckPassed:false,statusRecheckReason:'OUTSIDE_FINAL_T20_T90_WINDOW',providerFixtureStatus:status,finalMinutesToKickoff:+mins.toFixed(2)};\n  const league=val(f,['league.name','competition.name','league_name','competition_name']);\n  const country=val(f,['league.country','country.name','country','competition.country']);\n  const selected={...c,kickoff:ko,league:league||c.league||null,country:country||c.country||null};\n  let text=String(src.text||'');\n  if((league||country)&&!text.includes('🏆 ')){\n    const comp=[country,league].filter(Boolean).join(' · ');\n    text=text.replace(/(⚽ <b>[^\\n]+<\\/b>\\n)/, '$1🏆 <b>'+comp+'</b>\\n');\n  }\n  return {...src,text,selected,statusRecheckPassed:true,statusRecheckReason:null,providerFixtureStatus:status,finalMinutesToKickoff:+mins.toFixed(2),league:league||null,country:country||null,engineVersion:'FUSION_ENGINE_V1_5_3_18_PRODUCTION_CLEANUP'};\n}catch(e){\n  return {...src,statusRecheckPassed:false,statusRecheckReason:'STATUS_RECHECK_ERROR:'+String(e.message||e)};\n}"
+      },
+      "id": "2161e2c3-2381-4e1f-aa53-57a48c1fe0b9",
+      "name": "15 · FINAL Fixture Status Recheck",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3328,
+        1888
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c3734db4-bb8e-48e2-8a56-7c3c2da129dd",
+              "leftValue": "={{ $json.statusRecheckPassed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f50b83cd-c60d-49d4-ac13-25ed70eb5675",
+      "name": "15A · IF Fixture Still Scheduled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3600,
+        1888
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst API_BASE=$env.SR626_PROVIDER_API_BASE || 'https://api.5dollarfootballapi.com/v1';\nconst API_KEY=$env.SR626_PROVIDER_API_KEY || 'SET_SR626_PROVIDER_API_KEY_IN_N8N_ENV';\nconst now=Date.now();\nasync function get(path){\n  let last=null;\n  for(let a=0;a<3;a++){\n    try{\n      const r=await this.helpers.httpRequest({method:'GET',url:API_BASE.replace(/\\/$/,'')+path,\n        headers:{'X-API-Key':API_KEY,'x-api-key':API_KEY,'Authorization':`Bearer ${API_KEY}`},\n        json:true,timeout:20000,returnFullResponse:true,ignoreHttpStatusErrors:true});\n      const s=Number(r.statusCode||0);\n      if(s>=200&&s<300)return r.body;\n      if(![408,429,500,502,503,504].includes(s))throw new Error('HTTP_'+s);\n      last=new Error('HTTP_'+s);\n    }catch(e){last=e;}\n    if(a<2)await new Promise(r=>setTimeout(r,a?12000:8000));\n  }\n  throw last||new Error('DISCOVERY_FAILED');\n}\nconst unwrap=b=>Array.isArray(b)?b:Array.isArray(b?.data)?b.data:Array.isArray(b?.response)?b.response:Array.isArray(b?.fixtures)?b.fixtures:[];\nconst windowStartTs=Math.floor((now-5*60*1000)/1000);\n// Full forward-day coverage: every scheduled fixture in the next 24h is discovered.\n// Heavy history/odds/model work still runs only for fixtures entering the analysis window.\nconst windowEndTs=windowStartTs+24*60*60;\nconst perPage=100;\nconst emergencyMaxPages=100; // safety only\nconst all=[];\nconst seen=new Set();\nconst pages=[];\nconst errors=[];\nlet error=null;\nlet stalledWindows=0;\nlet emergencyHit=false;\nconst fixtureKey=f=>{\n  const id=Number(f?.id??f?.fixture_id??f?.fixture?.id);\n  return Number.isFinite(id)?String(id):JSON.stringify([f?.kickoff_utc,f?.teams?.home?.id,f?.teams?.away?.id]);\n};\n// Paginates one time window. Does NOT trust only pagination.has_more: the provider may cap per_page,\n// omit has_more, or report it wrongly. Keeps going while pages are full / totals say more exist,\n// and stops only when a page brings no NEW fixtures. If a window stalls on a full page\n// (provider ignores `page`), it is split into smaller time slices and each slice is paginated.\nconst fetchWindow=async (sTs,eTs,depth)=>{\n  let page=1, stalled=false, lastFull=false;\n  while(pages.length<emergencyMaxPages){\n    const path=`/fixtures?status=scheduled&start_time=${sTs}&end_time=${eTs}&page=${page}&per_page=${perPage}`;\n    let body,rows;\n    try{\n      body=await get.call(this,path);\n      rows=unwrap(body);\n    }catch(e){error=e;errors.push({path,error:e.message});return;}\n    let added=0;\n    for(const f of rows){\n      const key=fixtureKey(f);\n      if(!seen.has(key)){seen.add(key);all.push(f);added++;}\n    }\n    const pg=body?.pagination||body?.meta?.pagination||body?.meta||{};\n    const effPer=Number(pg.per_page??pg.limit??0)||perPage;\n    const total=Number(pg.total??pg.total_count??pg.total_items??body?.total??0)||0;\n    const totalPages=Number(pg.total_pages??pg.pages??pg.last_page??0)||0;\n    const cur=Number(pg.page??pg.current_page??page)||page;\n    const nextRef=pg.next_page??pg.next??body?.next_page??null;\n    const explicit=pg.has_more!==undefined?Boolean(pg.has_more):(pg.has_next!==undefined?Boolean(pg.has_next):null);\n    const fullPage=rows.length>0&&rows.length>=Math.min(effPer,perPage);\n    const signalMore=explicit===true||(nextRef!=null&&nextRef!==false&&nextRef!=='')||(totalPages>0&&cur<totalPages)||(total>0&&seen.size<total);\n    pages.push({window:[sTs,eTs],page:cur,per_page:effPer,count:Number(pg.count??rows.length),has_more:explicit,rows_received:rows.length,new_rows:added,total:total||null,total_pages:totalPages||null,signalMore,fullPage});\n    lastFull=fullPage;\n    if(rows.length===0)return;\n    if(added===0){stalled=fullPage;break;}\n    // continue if provider says more OR page is full (provider may lie / cap per_page)\n    if(!(signalMore||fullPage))return;\n    page++;\n    await new Promise(r=>setTimeout(r,7000));\n  }\n  if(pages.length>=emergencyMaxPages){emergencyHit=true;return;}\n  if(stalled&&depth<4&&(eTs-sTs)>1800){\n    stalledWindows++;\n    const mid=Math.floor((sTs+eTs)/2);\n    await fetchWindow(sTs,mid,depth+1);\n    await fetchWindow(mid,eTs,depth+1);\n  }\n};\nawait fetchWindow(windowStartTs,windowEndTs,0);\nconst hasMore=emergencyHit;\n\nconst path=`/fixtures?status=scheduled&start_time=${windowStartTs}&end_time=${windowEndTs}&page=1&per_page=${perPage}`;\nconst body=pages.length?true:null;\n\n// Full 24h discovery is itself the coverage control; no extra self-test request is needed.\nconst discoverySelfTest={triggered:false,window:null,pagesRequested:0,rowsReceived:0,fixtures:[],error:null};\n\nconst fixtures=[];\nconst nearest=[];\nconst rejectCounts={\n  PAST_OR_STARTED:0,\n  FUTURE_OUTSIDE_WINDOW:0,\n  INVALID_KICKOFF:0,\n  INVALID_ID:0,\n  INVALID_STATUS:0\n};\nconst allowedStatuses=['NS','SCHEDULED','NOT_STARTED','NOT STARTED','TIMED','UPCOMING',''];\n\nfor(const f of all){\n  const id=Number(f?.id??f?.fixture_id??f?.fixture?.id);\n  const ko =\n    f?.kickoff_utc ??\n    (f?.kickoff_ts != null && Number.isFinite(Number(f.kickoff_ts))\n      ? new Date(Number(f.kickoff_ts) * 1000).toISOString()\n      : null);\n  const ms=Date.parse(ko||'');\n  const st=String((typeof f?.status==='string'?f.status:null)??f?.status?.short??f?.status?.name??f?.fixture?.status?.short??f?.state??'').toUpperCase();\n\n  const base={\n    fixture_id:Number.isFinite(id)?id:null,\n    kickoff:ko||null,\n    minutes_to_kickoff:Number.isFinite(ms)?+((ms-now)/60000).toFixed(2):null,\n    home_team_id:Number(f?.home?.id??f?.teams?.home?.id??f?.home_team?.id??0)||null,\n    away_team_id:Number(f?.away?.id??f?.teams?.away?.id??f?.away_team?.id??0)||null,\n    home_team:f?.home?.name??f?.teams?.home?.name??f?.home_team?.name??f?.home_team??null,\n    away_team:f?.away?.name??f?.teams?.away?.name??f?.away_team?.name??f?.away_team??null,\n    league:f?.league?.name??f?.competition?.name??f?.league_name??null,\n    country:f?.league?.country??f?.country?.name??f?.country??null,\n    provider_status:st||null\n  };\n\n  if(!id){\n    rejectCounts.INVALID_ID++;\n    continue;\n  }\n  if(!Number.isFinite(ms)){\n    rejectCounts.INVALID_KICKOFF++;\n    continue;\n  }\n\n  nearest.push(base);\n\n  if(!allowedStatuses.includes(st)){\n    rejectCounts.INVALID_STATUS++;\n    continue;\n  }\n\n  const mins=(ms-now)/60000;\n  if(mins<=0){\n    rejectCounts.PAST_OR_STARTED++;\n    continue;\n  }\n  if(mins<20||mins>90){\n    rejectCounts.FUTURE_OUTSIDE_WINDOW++;\n    continue;\n  }\n\n  fixtures.push(base);\n}\n\nnearest.sort((a,b)=>{\n  const aa=a.minutes_to_kickoff==null?Number.POSITIVE_INFINITY:a.minutes_to_kickoff;\n  const bb=b.minutes_to_kickoff==null?Number.POSITIVE_INFINITY:b.minutes_to_kickoff;\n  // Upcoming first, then recently passed.\n  const ap=aa>=0?0:1, bp=bb>=0?0:1;\n  if(ap!==bp)return ap-bp;\n  return ap===0?aa-bb:bb-aa;\n});\n\nconst nearestUpcomingFixtures=nearest.filter(x=>x.minutes_to_kickoff!=null && x.minutes_to_kickoff>0).slice(0,10);\nconst recentlyStartedFixtures=nearest.filter(x=>x.minutes_to_kickoff!=null && x.minutes_to_kickoff<=0).slice(0,5);\n\nreturn [{json:{\n  engineVersion:'FUSION_ENGINE_V1_5_3_18_PRODUCTION_CLEANUP',\n  discoveryIndependent:true,\n  discoveryPath:path,\n  discoveryMode:'COMPLETE_24H_PROVIDER_PAGINATION_UNTIL_HAS_MORE_FALSE_T20_T90',\n  discoveryWindow:{start:new Date(windowStartTs*1000).toISOString(),end:new Date(windowEndTs*1000).toISOString()},\n  discoveryPagination:{pagesRequested:pages.length,pages,complete:!hasMore&&!errors.length,providerHasMoreAtStop:hasMore,emergencyLimitReached:emergencyHit,stalledWindowsSplit:stalledWindows,errors},\n  discoverySelfTest,\n  fixturesFetched:all.length,\n  fixturesInWatchWindow:fixtures.length,\n  fixtures,\n  nearestUpcomingFixtures,\n  recentlyStartedFixtures,\n  rejectCounts,\n  earliestUpcomingMinutes:nearestUpcomingFixtures.length?nearestUpcomingFixtures[0].minutes_to_kickoff:null,\n  discoveryError:errors.length?errors.map(x=>x.error).join('; '):(error?.message||null),\n  observedAt:new Date().toISOString()\n}}];\n\n"
+      },
+      "id": "9da0fccb-17db-4ea2-8d05-0591abea819d",
+      "name": "01 · Independent Upcoming Fixture Discovery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -928,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const src=$json||{};\nconst prior=$('20 · Persist T-30 Pick').item.json||{};\nconst msgId=Number(src.message_id ?? src.result?.message_id ?? src.message?.message_id ?? src.data?.message_id ?? 0);\nconst pickId=Number(prior.pick_id ?? prior.dbRow?.id ?? prior.id ?? prior.db_id ?? 0);\nif(!Number.isFinite(msgId)||msgId<=0) throw new Error('V6352_TELEGRAM_MESSAGE_ID_MISSING');\nif(!Number.isFinite(pickId)||pickId<=0) throw new Error('V6352_PICK_ID_MISSING_AFTER_TELEGRAM');\nconst SUPABASE_URL=$env.SUPABASE_URL || prior.supabase_url || 'https://nhgqksizfyumdqmuuznx.supabase.co';\nconst SUPABASE_KEY=$env.SUPABASE_SERVICE_KEY || prior.supabase_key || 'SET_SUPABASE_SECRET_IN_N8N_ENV';\nconst r=await this.helpers.httpRequest({method:'PATCH',url:`${SUPABASE_URL.replace(/\\/$/,'')}/rest/v1/sr_fusion_engine_picks?id=eq.${pickId}`,headers:{apikey:SUPABASE_KEY,Authorization:`Bearer ${SUPABASE_KEY}`,'Content-Type':'application/json',Prefer:'return=representation'},body:{telegram_message_id:msgId,telegram_chat_id:'-1003038027412',publication_status:'PUBLISHED',publication_published_at:new Date().toISOString(),settlement_status:'OPEN'},json:true,returnFullResponse:true,ignoreHttpStatusErrors:true});\nconst sc=Number(r.statusCode||0); if(sc<200||sc>=300) throw new Error(`V6352_SAVE_MESSAGE_ID_FAILED HTTP_${sc}`);\nconst saved=Array.isArray(r.body)?r.body[0]:r.body;\nif(Number(saved?.telegram_message_id)!==msgId) throw new Error('V6352_SAVE_MESSAGE_ID_NOT_CONFIRMED');\nreturn {...prior,telegramSaved:true,pick_id:pickId,telegram_message_id:msgId};"
+      },
+      "id": "b898ba68-7166-41db-ba21-145f5eea5edf",
+      "name": "22 · Save Telegram Message ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4272,
+        1776
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "9,24,39,54 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "0ded74e7-84df-434e-9789-508230a55048",
+      "name": "30 · Settlement every 15m · offset 09",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1056,
+        2176
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst API_BASE=$env.SR626_PROVIDER_API_BASE || 'https://api.5dollarfootballapi.com/v1';\nconst API_KEY=$env.SR626_PROVIDER_API_KEY || 'SET_SR626_PROVIDER_API_KEY_IN_N8N_ENV';\nconst SUPABASE_URL=$env.SUPABASE_URL || 'https://nhgqksizfyumdqmuuznx.supabase.co';\nconst SUPABASE_KEY=$env.SUPABASE_SERVICE_KEY || 'SET_SUPABASE_SECRET_IN_N8N_ENV';\nconst sleep=ms=>new Promise(r=>setTimeout(r,ms));\n\nasync function req(opts){\n  let last=null;\n  for(let a=0;a<3;a++){\n    try{\n      const r=await this.helpers.httpRequest({...opts,returnFullResponse:true,ignoreHttpStatusErrors:true,timeout:30000});\n      const sc=Number(r?.statusCode||0);\n      if(sc>=200&&sc<300)return {ok:true,status:sc,body:r.body};\n      if(![408,429,500,502,503,504].includes(sc))\n        return {ok:false,status:sc,error:'HTTP_'+sc,body:r.body};\n      last={status:sc,error:'HTTP_'+sc,body:r.body};\n    }catch(e){last={status:0,error:String(e?.message||e)};}\n    if(a<2)await sleep(a===0?8000:12000);\n  }\n  return {ok:false,...(last||{error:'REQUEST_FAILED'})};\n}\nconst sbHeaders={apikey:SUPABASE_KEY,Authorization:`Bearer ${SUPABASE_KEY}`,'Content-Type':'application/json'};\nconst unwrap=b=>b?.data??b?.fixture??b;\nconst num=x=>x==null?null:Number(x);\nconst fin=x=>Number.isFinite(Number(x));\nconst leg=x=>x>1e-12?1:x<-1e-12?-1:0;\nconst money=(x)=>Math.round((Number(x)+Number.EPSILON)*100)/100;\n\nfunction settleAsian(side,line,h,a,odd,stake){\n  const diff=side==='HOME'?h-a:a-h, q=Math.round(Number(line)*4)/4;\n  const quarter=Math.abs(q*2-Math.round(q*2))>1e-9;\n  const profit=r=>r>0?stake*(odd-1):r<0?-stake:0;\n  if(!quarter){\n    const r=leg(diff+q);\n    return {status:r>0?'WON':r<0?'LOSS':'PUSH',pnl:money(profit(r))};\n  }\n  const lo=Math.floor(q*2)/2,hi=Math.ceil(q*2)/2,half=stake/2;\n  const rs=[leg(diff+lo),leg(diff+hi)];\n  const p=rs.reduce((s,r)=>s+(r>0?half*(odd-1):r<0?-half:0),0);\n  const status=rs.every(r=>r>0)?'WON':rs.every(r=>r<0)?'LOSS':\n    rs.includes(1)&&rs.includes(0)?'HALF_WON':\n    rs.includes(-1)&&rs.includes(0)?'HALF_LOST':'PUSH';\n  return {status,pnl:money(p)};\n}\nfunction settleGoals(side,line,h,a,odd,stake){\n  const total=h+a,q=Math.round(Number(line)*4)/4;\n  const quarter=Math.abs(q*2-Math.round(q*2))>1e-9;\n  const result=L=>leg(side==='OVER'?total-L:L-total);\n  if(!quarter){\n    const r=result(q);\n    return {status:r>0?'WON':r<0?'LOSS':'PUSH',\n      pnl:money(r>0?stake*(odd-1):r<0?-stake:0)};\n  }\n  const lo=Math.floor(q*2)/2,hi=Math.ceil(q*2)/2,half=stake/2;\n  const rs=[result(lo),result(hi)];\n  const pnl=rs.reduce((s,r)=>s+(r>0?half*(odd-1):r<0?-half:0),0);\n  const status=rs.every(r=>r>0)?'WON':rs.every(r=>r<0)?'LOSS':\n    rs.includes(1)&&rs.includes(0)?'HALF_WON':\n    rs.includes(-1)&&rs.includes(0)?'HALF_LOST':'PUSH';\n  return {status,pnl:money(pnl)};\n}\nfunction settlePick(p,h,a){\n  const fam=String(p.market_family||'').toUpperCase(), side=String(p.side||'').toUpperCase();\n  const odd=Number(p.odd),stake=Number(p.stake||100),line=num(p.line);\n  if(!fin(odd)||!fin(stake))return null;\n  if(fam==='BTTS'){\n    const yes=h>0&&a>0, wantYes=['YES','BTTS_YES'].includes(side);\n    const win=wantYes===yes; return {status:win?'WON':'LOSS',pnl:money(win?stake*(odd-1):-stake)};\n  }\n  if(fam==='MONEYLINE'){\n    const actual=h>a?'HOME':h<a?'AWAY':'DRAW';\n    const normalized=side.replace('_WIN','');\n    const win=normalized===actual; return {status:win?'WON':'LOSS',pnl:money(win?stake*(odd-1):-stake)};\n  }\n  if(fam==='DOUBLE_CHANCE'){\n    const win=(['1X','ONE_X'].includes(side)&&h>=a)||(['X2','X_TWO'].includes(side)&&a>=h)||(['12','ONE_TWO'].includes(side)&&h!==a);\n    return {status:win?'WON':'LOSS',pnl:money(win?stake*(odd-1):-stake)};\n  }\n  if(fam==='GOALS'&&fin(line))return settleGoals(side,Number(line),h,a,odd,stake);\n  if(fam==='ASIAN_HANDICAP'&&fin(line))return settleAsian(side,Number(line),h,a,odd,stake);\n  return null;\n}\n\nconst openRes=await req.call(this,{\n  method:'GET',\n  url:`${SUPABASE_URL.replace(/\\/$/,'')}/rest/v1/sr_fusion_engine_picks?settlement_status=eq.OPEN&select=*&order=kickoff.asc`,\n  headers:sbHeaders,json:true\n});\nif(!openRes.ok) return [{json:{diagnostic:true,settlementRun:true,error:'OPEN_ROWS_QUERY_FAILED',httpStatus:openRes.status||0,detail:openRes.error||null}}];\n\nconst rows=Array.isArray(openRes.body)?openRes.body:[];\n\nconst out=[];\nlet settled=0,repliesReady=0,providerErrors=0,notFinal=0,invalidScore=0,unsupported=0,patchErrors=0;\nfor(const p of rows){\n  const fid=Number(p.fixture_id);\n  const fx=await req.call(this,{\n    method:'GET',url:`${API_BASE.replace(/\\/$/,'')}/fixtures/${fid}`,\n    headers:{'X-API-Key':API_KEY,'x-api-key':API_KEY,Authorization:`Bearer ${API_KEY}`,Accept:'application/json'},json:true\n  });\n  await sleep(7000);\n  if(!fx.ok){\n    providerErrors++;\n    out.push({json:{diagnostic:true,settlementRun:true,pick_id:p.id,fixture_id:fid,home_team:p.home_team,away_team:p.away_team,settled:false,reason:'PROVIDER_ERROR',httpStatus:fx.status||0}});\n    continue;\n  }\n  const f=unwrap(fx.body)||{};\n  const status=String(typeof f.status==='string'?f.status:(f.status?.short??f.status?.name??f.status_code??'')).trim().toUpperCase();\n  if(['POSTPONED','CANCELLED','CANCELED','ABANDONED'].includes(status)){\n    const patch=await req.call(this,{method:'PATCH',url:`${SUPABASE_URL}/rest/v1/sr_fusion_engine_picks?id=eq.${p.id}`,\n      headers:{...sbHeaders,Prefer:'return=minimal'},body:{settlement_status:'VOID',pnl:0,return_amount:Number(p.stake||100),settled_at:new Date().toISOString(),settlement_note:'Provider status '+status,settlement_reply_status:(Number(p.telegram_message_id)>0?'PENDING':'NOT_APPLICABLE')},json:true});\n    if(!patch.ok){patchErrors++;continue;}\n    settled++;\n    const ready=!!p.telegram_message_id; if(ready)repliesReady++;\n    out.push({json:{settlementRun:true,settled:true,pick_id:p.id,fixture_id:fid,status:'VOID',pnl:0,telegram_message_id:p.telegram_message_id||null,replyReady:ready,\n      reply_text:'⚪ VOID'}});\n    continue;\n  }\n  const finalStatuses=new Set(['FINISHED','FT','AET','AFTER_EXTRA_TIME','FULL_TIME']);\n  if(!finalStatuses.has(status)){\n    notFinal++;\n    out.push({json:{diagnostic:true,settlementRun:true,pick_id:p.id,fixture_id:fid,home_team:p.home_team,away_team:p.away_team,provider_status:status||null,settled:false,reason:'NOT_FINAL'}});\n    continue;\n  }\n  const h=num(f?.goals?.home??f?.score?.home??f?.home_score);\n  const a=num(f?.goals?.away??f?.score?.away??f?.away_score);\n  if(!fin(h)||!fin(a)){\n    invalidScore++;\n    out.push({json:{diagnostic:true,settlementRun:true,pick_id:p.id,fixture_id:fid,settled:false,reason:'FINAL_WITHOUT_SCORE',provider_status:status}});\n    continue;\n  }\n  const r=settlePick(p,Number(h),Number(a));\n  if(!r){\n    unsupported++;\n    out.push({json:{diagnostic:true,settlementRun:true,pick_id:p.id,fixture_id:fid,settled:false,reason:'UNSUPPORTED_MARKET',market_family:p.market_family,side:p.side,line:p.line}});\n    continue;\n  }\n  const stake=Number(p.stake||100), ret=money(stake+r.pnl);\n  const patchBody={settlement_status:r.status,home_score:Number(h),away_score:Number(a),settled_at:new Date().toISOString(),pnl:r.pnl,return_amount:ret,settlement_note:`${r.status} · FT ${h}:${a}`,settlement_reply_status:(Number(p.telegram_message_id)>0?'PENDING':'NOT_APPLICABLE')};\n  const patch=await req.call(this,{method:'PATCH',url:`${SUPABASE_URL}/rest/v1/sr_fusion_engine_picks?id=eq.${p.id}`,\n    headers:{...sbHeaders,Prefer:'return=minimal'},body:patchBody,json:true});\n  if(!patch.ok){\n    patchErrors++;\n    out.push({json:{diagnostic:true,settlementRun:true,pick_id:p.id,fixture_id:fid,settled:false,reason:'DB_PATCH_FAILED',httpStatus:patch.status||0}});\n    continue;\n  }\n  settled++;\n  const ready=Number(p.telegram_message_id)>0; if(ready)repliesReady++;\n  const label=r.status==='WON'?'✅ WON':r.status==='LOSS'?'❌ LOSS':r.status==='PUSH'?'🟡 PUSH':r.status==='HALF_WON'?'🟢 HALF WON':r.status==='HALF_LOST'?'🔴 HALF LOST':r.status;\n  const sign=r.pnl>0?'+':'';\n  out.push({json:{\n    settlementRun:true,settled:true,pick_id:p.id,fixture_id:fid,home_team:p.home_team,away_team:p.away_team,\n    status:r.status,pnl:r.pnl,return_amount:ret,home_score:Number(h),away_score:Number(a),\n    telegram_chat_id:p.telegram_chat_id||'-1003038027412',telegram_message_id:p.telegram_message_id||null,\n    replyReady:ready,settlement_reply_status:(ready?'PENDING':'NOT_APPLICABLE'),reply_text:`${label} · ${h}:${a} · P/L ${sign}${r.pnl.toFixed(2)} €`\n  }});\n}\n\n\n// Recover crashed Telegram sends. A SENDING claim older than 20 minutes is\n// returned to PENDING before the queue is read.\nconst staleCutoff=new Date(Date.now()-20*60*1000).toISOString();\nawait req.call(this,{\n  method:'PATCH',\n  url:`${SUPABASE_URL.replace(/\\/$/,'')}/rest/v1/sr_fusion_engine_picks?settlement_reply_status=eq.SENDING&reply_claimed_at=lt.${encodeURIComponent(staleCutoff)}&reply_sent=eq.false`,\n  headers:{...sbHeaders,Prefer:'return=minimal'},\n  body:{settlement_reply_status:'PENDING',reply_claimed_at:null,reply_claim_token:null},\n  json:true\n});\n\n// Recovery queue: any already-settled published pick whose Telegram reply has not been confirmed.\n// This is deliberately independent from OPEN settlement so a Telegram failure never loses the reply.\nconst pendingRes=await req.call(this,{\n  method:'GET',\n  url:`${SUPABASE_URL.replace(/\\/$/,'')}/rest/v1/sr_fusion_engine_picks?settlement_status=in.(WON,LOSS,PUSH,HALF_WON,HALF_LOST,VOID)&telegram_message_id=not.is.null&settlement_reply_status=in.(PENDING,FAILED)&select=*&order=settled_at.asc`,\n  headers:sbHeaders,json:true\n});\nlet recoveryQueued=0;\nif(pendingRes.ok){\n  const pending=Array.isArray(pendingRes.body)?pendingRes.body:[];\n  const already=new Set(out.filter(x=>x?.json?.replyReady).map(x=>Number(x.json.pick_id)));\n  for(const p of pending){\n    if(already.has(Number(p.id))) continue;\n    const st=String(p.settlement_status||'').toUpperCase();\n    const label=st==='WON'?'✅ WON':st==='LOSS'?'❌ LOSS':st==='PUSH'?'🟡 PUSH':st==='HALF_WON'?'🟢 HALF WON':st==='HALF_LOST'?'🔴 HALF LOST':st==='VOID'?'⚪ VOID':st;\n    const hs=Number.isFinite(Number(p.home_score))?Number(p.home_score):null;\n    const as=Number.isFinite(Number(p.away_score))?Number(p.away_score):null;\n    const score=(hs!==null&&as!==null)?`${hs}:${as}`:'—';\n    const pnl=Number(p.pnl||0), sign=pnl>0?'+':'';\n    out.push({json:{\n      settlementRun:true,recovery:true,settled:true,pick_id:p.id,fixture_id:p.fixture_id,\n      home_team:p.home_team,away_team:p.away_team,status:st,pnl,\n      home_score:hs,away_score:as,\n      telegram_chat_id:p.telegram_chat_id||'-1003038027412',\n      telegram_message_id:p.telegram_message_id,\n      replyReady:true,settlement_reply_status:String(p.settlement_reply_status||'PENDING'),\n      reply_text:`${label} · ${score} · P/L ${sign}${pnl.toFixed(2)} €`\n    }});\n    recoveryQueued++;\n  }\n}else{\n  out.push({json:{diagnostic:true,settlementRun:true,recoveryQueryFailed:true,httpStatus:pendingRes.status||0,detail:pendingRes.error||null}});\n}\n\nif(!out.length) out.push({json:{diagnostic:true,settlementRun:true,openRows:rows.length,settled:0,repliesReady:0,reason:'NO_SETTLEMENT_OUTPUT'}});\nout.push({json:{diagnostic:true,settlementSummary:true,openRows:rows.length,settled,repliesReady,recoveryQueued,providerErrors,notFinal,invalidScore,unsupported,patchErrors,observedAt:new Date().toISOString()}});\nreturn out;\n"
+      },
+      "id": "5f0fb80b-baf0-491f-86ec-36ab74d80796",
+      "name": "31 · Settlement Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -784,
+        2176
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "2d6f893c-de5b-431a-a0d2-f8a0ce424099",
+              "leftValue": "={{ $json.replyReady }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6265d3ce-7d17-4a4b-80c6-52176b7f0aa5",
+      "name": "32 · IF Reply Available?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -528,
+        2176
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.telegram_chat_id || '-1003038027412' }}",
+        "text": "={{ $json.reply_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "reply_to_message_id": "={{ $json.telegram_message_id }}"
+        }
+      },
+      "id": "830f62c9-3137-4924-bc3b-3c204d7145ce",
+      "name": "33 · Reply WON LOSS to Original",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -256,
+        2176
+      ],
+      "webhookId": "adeb1414-ad12-4b59-a59d-6bd741b5be12",
+      "credentials": {
+        "telegramApi": {
+          "id": "HRAZxfaNbMK1280u",
+          "name": "Telegram account"
+        }
+      },
+      "notes": "v6.35.2: native n8n Telegram Send Message field `reply_to_message_id`; attribution disabled."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "2e138f07-c266-4575-a7eb-f229a10c24a3",
+      "name": "40 · Daily Report 06:30 · Previous Day",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1056,
+        2464
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json:{report_kind:'DAILY',completed_period:true}}];"
+      },
+      "id": "36538f21-7f06-4102-96db-365a910528c1",
+      "name": "DAILY · Set Report Kind",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -784,
+        2464
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst SUPABASE_URL=$env.SUPABASE_URL || 'https://nhgqksizfyumdqmuuznx.supabase.co';\nconst KEY=$env.SUPABASE_SERVICE_KEY || $env.SUPABASE_KEY || 'SET_SUPABASE_SECRET_IN_N8N_ENV';\nif(!SUPABASE_URL||!KEY) throw new Error('FUSION_REPORT_MISSING_SUPABASE_CONFIG');\nconst kind=String($json.report_kind||'DAILY').toUpperCase();\nconst TZ='Europe/Sofia';\nconst BOUNDARY_HOUR=6, BOUNDARY_MINUTE=30;\n\nfunction ymdInSofia(d){\n  const parts=new Intl.DateTimeFormat('en-CA',{timeZone:TZ,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d);\n  const o={}; for(const p of parts)o[p.type]=p.value;\n  return `${o.year}-${o.month}-${o.day}`;\n}\nfunction addDays(ymd,n){\n  const [y,m,d]=ymd.split('-').map(Number);\n  const x=new Date(Date.UTC(y,m-1,d+n,12));\n  return `${x.getUTCFullYear()}-${String(x.getUTCMonth()+1).padStart(2,'0')}-${String(x.getUTCDate()).padStart(2,'0')}`;\n}\nfunction localDateTimeUtc(ymd,hour=0,minute=0){\n  const probe=new Date(ymd+'T12:00:00Z');\n  const parts=new Intl.DateTimeFormat('en-US',{timeZone:TZ,timeZoneName:'longOffset',hour:'2-digit'}).formatToParts(probe);\n  const z=parts.find(p=>p.type==='timeZoneName')?.value||'GMT+03:00';\n  const m=z.match(/GMT([+-])(\\d{2}):(\\d{2})/);\n  const off=m?((m[1]==='-'?-1:1)*(Number(m[2])*60+Number(m[3]))):180;\n  return new Date(Date.parse(`${ymd}T${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}:00Z`)-off*60000);\n}\nconst today=ymdInSofia(new Date());\nlet fromYmd,toYmd,label='';\nif(kind==='DAILY'){\n  fromYmd=addDays(today,-1); toYmd=today; label=fromYmd;\n}else if(kind==='WEEKLY'){\n  const noon=new Date(today+'T12:00:00Z');\n  const daysSinceMonday=(noon.getUTCDay()+6)%7;\n  const thisMonday=addDays(today,-daysSinceMonday);\n  fromYmd=addDays(thisMonday,-7); toYmd=thisMonday;\n  label=`${fromYmd} – ${addDays(toYmd,-1)}`;\n}else if(kind==='MONTHLY'){\n  const [y,m]=today.split('-').map(Number);\n  const firstThis=`${y}-${String(m).padStart(2,'0')}-01`;\n  const prevDate=new Date(Date.UTC(y,m-2,1,12));\n  fromYmd=`${prevDate.getUTCFullYear()}-${String(prevDate.getUTCMonth()+1).padStart(2,'0')}-01`;\n  toYmd=firstThis; label=fromYmd.slice(0,7);\n}else throw new Error('FUSION_REPORT_UNKNOWN_KIND_'+kind);\n\n// Reporting day closes at 06:30 Sofia time. Use publication time, not kickoff.\nconst from=localDateTimeUtc(fromYmd,BOUNDARY_HOUR,BOUNDARY_MINUTE);\nconst to=localDateTimeUtc(toYmd,BOUNDARY_HOUR,BOUNDARY_MINUTE);\nconst base=SUPABASE_URL.replace(/\\/$/,'');\nconst url=`${base}/rest/v1/sr_fusion_engine_picks?publication_published_at=gte.${encodeURIComponent(from.toISOString())}&publication_published_at=lt.${encodeURIComponent(to.toISOString())}&telegram_message_id=not.is.null&publication_status=eq.PUBLISHED&select=*`;\nconst res=await this.helpers.httpRequest({method:'GET',url,headers:{apikey:KEY,Authorization:`Bearer ${KEY}`},json:true,returnFullResponse:true,ignoreHttpStatusErrors:true,timeout:20000});\nconst sc=Number(res?.statusCode||0);\nif(sc<200||sc>=300) throw new Error(`FUSION_REPORT_QUERY_FAILED_HTTP_${sc}`);\nconst rows=Array.isArray(res.body)?res.body:[];\nconst finalStates=new Set(['WON','LOSS','PUSH','HALF_WON','HALF_LOST','VOID']);\nconst settled=rows.filter(r=>finalStates.has(String(r.settlement_status||'').toUpperCase()));\nconst stake=settled.filter(r=>String(r.settlement_status||'').toUpperCase()!=='VOID').reduce((s,r)=>s+Number(r.stake||0),0);\nconst pnl=settled.reduce((s,r)=>s+Number(r.pnl||0),0);\nconst counts={}; for(const r of settled){const k=String(r.settlement_status||'').toUpperCase();counts[k]=(counts[k]||0)+1;}\nconst title=kind==='DAILY'?'ДНЕВЕН':kind==='WEEKLY'?'СЕДМИЧЕН':'МЕСЕЧЕН';\nconst wins=(counts.WON||0)+(counts.HALF_WON||0);\nconst losses=(counts.LOSS||0)+(counts.HALF_LOST||0);\nconst extras=(counts.PUSH||0)+(counts.VOID||0);\nconst text=`📊 ${title} ОТЧЕТ · ${label}\n🎯 ${rows.length} сигнала · ✅ ${wins} · ❌ ${losses}${extras?` · ↔️ ${extras}`:''}\n💰 ${pnl>=0?'+':''}${pnl.toFixed(2)} € · ROI ${stake?((pnl/stake)*100).toFixed(1):'0.0'}%`;\nreturn [{json:{report_kind:kind,report_text:text,published_count:rows.length,settled_count:settled.length,pnl:+pnl.toFixed(2),roi:stake?+(pnl/stake*100).toFixed(2):0,from:from.toISOString(),to:to.toISOString(),queryOk:true,reportBoundary:'06:30 Europe/Sofia',reportBasis:'publication_published_at'}}];\n"
+      },
+      "id": "a40cbec7-46e4-4440-9b59-56c63bdb383d",
+      "name": "DAILY · Build Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -528,
+        2464
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "-1003038027412",
+        "text": "={{ $json.report_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "43a0aab9-0d0b-4368-9824-23e2647e1436",
+      "name": "DAILY · Telegram Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -256,
+        2464
+      ],
+      "webhookId": "a96cfa68-0de9-4e40-8066-2c87e98a8baa",
+      "credentials": {
+        "telegramApi": {
+          "id": "HRAZxfaNbMK1280u",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "35 6 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "fa64f2e3-0e1a-4893-ac7c-d6f186770438",
+      "name": "50 · Weekly Report Monday 06:35 · Previous Week",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1056,
+        2768
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json:{report_kind:'WEEKLY',completed_period:true}}];"
+      },
+      "id": "484b3cfa-7ecd-43cd-b124-9a6f409f838b",
+      "name": "WEEKLY · Set Report Kind",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -784,
+        2768
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst SUPABASE_URL=$env.SUPABASE_URL || 'https://nhgqksizfyumdqmuuznx.supabase.co';\nconst KEY=$env.SUPABASE_SERVICE_KEY || $env.SUPABASE_KEY || 'SET_SUPABASE_SECRET_IN_N8N_ENV';\nif(!SUPABASE_URL||!KEY) throw new Error('FUSION_REPORT_MISSING_SUPABASE_CONFIG');\nconst kind=String($json.report_kind||'DAILY').toUpperCase();\nconst TZ='Europe/Sofia';\nconst BOUNDARY_HOUR=6, BOUNDARY_MINUTE=30;\n\nfunction ymdInSofia(d){\n  const parts=new Intl.DateTimeFormat('en-CA',{timeZone:TZ,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d);\n  const o={}; for(const p of parts)o[p.type]=p.value;\n  return `${o.year}-${o.month}-${o.day}`;\n}\nfunction addDays(ymd,n){\n  const [y,m,d]=ymd.split('-').map(Number);\n  const x=new Date(Date.UTC(y,m-1,d+n,12));\n  return `${x.getUTCFullYear()}-${String(x.getUTCMonth()+1).padStart(2,'0')}-${String(x.getUTCDate()).padStart(2,'0')}`;\n}\nfunction localDateTimeUtc(ymd,hour=0,minute=0){\n  const probe=new Date(ymd+'T12:00:00Z');\n  const parts=new Intl.DateTimeFormat('en-US',{timeZone:TZ,timeZoneName:'longOffset',hour:'2-digit'}).formatToParts(probe);\n  const z=parts.find(p=>p.type==='timeZoneName')?.value||'GMT+03:00';\n  const m=z.match(/GMT([+-])(\\d{2}):(\\d{2})/);\n  const off=m?((m[1]==='-'?-1:1)*(Number(m[2])*60+Number(m[3]))):180;\n  return new Date(Date.parse(`${ymd}T${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}:00Z`)-off*60000);\n}\nconst today=ymdInSofia(new Date());\nlet fromYmd,toYmd,label='';\nif(kind==='DAILY'){\n  fromYmd=addDays(today,-1); toYmd=today; label=fromYmd;\n}else if(kind==='WEEKLY'){\n  const noon=new Date(today+'T12:00:00Z');\n  const daysSinceMonday=(noon.getUTCDay()+6)%7;\n  const thisMonday=addDays(today,-daysSinceMonday);\n  fromYmd=addDays(thisMonday,-7); toYmd=thisMonday;\n  label=`${fromYmd} – ${addDays(toYmd,-1)}`;\n}else if(kind==='MONTHLY'){\n  const [y,m]=today.split('-').map(Number);\n  const firstThis=`${y}-${String(m).padStart(2,'0')}-01`;\n  const prevDate=new Date(Date.UTC(y,m-2,1,12));\n  fromYmd=`${prevDate.getUTCFullYear()}-${String(prevDate.getUTCMonth()+1).padStart(2,'0')}-01`;\n  toYmd=firstThis; label=fromYmd.slice(0,7);\n}else throw new Error('FUSION_REPORT_UNKNOWN_KIND_'+kind);\n\n// Reporting day closes at 06:30 Sofia time. Use publication time, not kickoff.\nconst from=localDateTimeUtc(fromYmd,BOUNDARY_HOUR,BOUNDARY_MINUTE);\nconst to=localDateTimeUtc(toYmd,BOUNDARY_HOUR,BOUNDARY_MINUTE);\nconst base=SUPABASE_URL.replace(/\\/$/,'');\nconst url=`${base}/rest/v1/sr_fusion_engine_picks?publication_published_at=gte.${encodeURIComponent(from.toISOString())}&publication_published_at=lt.${encodeURIComponent(to.toISOString())}&telegram_message_id=not.is.null&publication_status=eq.PUBLISHED&select=*`;\nconst res=await this.helpers.httpRequest({method:'GET',url,headers:{apikey:KEY,Authorization:`Bearer ${KEY}`},json:true,returnFullResponse:true,ignoreHttpStatusErrors:true,timeout:20000});\nconst sc=Number(res?.statusCode||0);\nif(sc<200||sc>=300) throw new Error(`FUSION_REPORT_QUERY_FAILED_HTTP_${sc}`);\nconst rows=Array.isArray(res.body)?res.body:[];\nconst finalStates=new Set(['WON','LOSS','PUSH','HALF_WON','HALF_LOST','VOID']);\nconst settled=rows.filter(r=>finalStates.has(String(r.settlement_status||'').toUpperCase()));\nconst stake=settled.filter(r=>String(r.settlement_status||'').toUpperCase()!=='VOID').reduce((s,r)=>s+Number(r.stake||0),0);\nconst pnl=settled.reduce((s,r)=>s+Number(r.pnl||0),0);\nconst counts={}; for(const r of settled){const k=String(r.settlement_status||'').toUpperCase();counts[k]=(counts[k]||0)+1;}\nconst title=kind==='DAILY'?'ДНЕВЕН':kind==='WEEKLY'?'СЕДМИЧЕН':'МЕСЕЧЕН';\nconst wins=(counts.WON||0)+(counts.HALF_WON||0);\nconst losses=(counts.LOSS||0)+(counts.HALF_LOST||0);\nconst extras=(counts.PUSH||0)+(counts.VOID||0);\nconst text=`📊 ${title} ОТЧЕТ · ${label}\n🎯 ${rows.length} сигнала · ✅ ${wins} · ❌ ${losses}${extras?` · ↔️ ${extras}`:''}\n💰 ${pnl>=0?'+':''}${pnl.toFixed(2)} € · ROI ${stake?((pnl/stake)*100).toFixed(1):'0.0'}%`;\nreturn [{json:{report_kind:kind,report_text:text,published_count:rows.length,settled_count:settled.length,pnl:+pnl.toFixed(2),roi:stake?+(pnl/stake*100).toFixed(2):0,from:from.toISOString(),to:to.toISOString(),queryOk:true,reportBoundary:'06:30 Europe/Sofia',reportBasis:'publication_published_at'}}];\n"
+      },
+      "id": "984501d2-f103-49f0-82e5-1b569d9bb196",
+      "name": "WEEKLY · Build Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -528,
+        2768
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "-1003038027412",
+        "text": "={{ $json.report_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "bf45f69b-595a-4756-a414-3729b933b8d8",
+      "name": "WEEKLY · Telegram Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -256,
+        2768
+      ],
+      "webhookId": "d1175381-3073-4a10-8a63-80cf41a3dd14",
+      "credentials": {
+        "telegramApi": {
+          "id": "HRAZxfaNbMK1280u",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "40 6 1 * *"
+            }
+          ]
+        }
+      },
+      "id": "7bf0167e-fd90-40f7-94e3-d9409fd2b7f5",
+      "name": "60 · Monthly Report day 1 06:40 · Previous Month",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1056,
+        3072
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json:{report_kind:'MONTHLY',completed_period:true}}];"
+      },
+      "id": "2a1f3e8b-df86-4066-ab62-0facccbff19d",
+      "name": "MONTHLY · Set Report Kind",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -784,
+        3072
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst SUPABASE_URL=$env.SUPABASE_URL || 'https://nhgqksizfyumdqmuuznx.supabase.co';\nconst KEY=$env.SUPABASE_SERVICE_KEY || $env.SUPABASE_KEY || 'SET_SUPABASE_SECRET_IN_N8N_ENV';\nif(!SUPABASE_URL||!KEY) throw new Error('FUSION_REPORT_MISSING_SUPABASE_CONFIG');\nconst kind=String($json.report_kind||'DAILY').toUpperCase();\nconst TZ='Europe/Sofia';\nconst BOUNDARY_HOUR=6, BOUNDARY_MINUTE=30;\n\nfunction ymdInSofia(d){\n  const parts=new Intl.DateTimeFormat('en-CA',{timeZone:TZ,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d);\n  const o={}; for(const p of parts)o[p.type]=p.value;\n  return `${o.year}-${o.month}-${o.day}`;\n}\nfunction addDays(ymd,n){\n  const [y,m,d]=ymd.split('-').map(Number);\n  const x=new Date(Date.UTC(y,m-1,d+n,12));\n  return `${x.getUTCFullYear()}-${String(x.getUTCMonth()+1).padStart(2,'0')}-${String(x.getUTCDate()).padStart(2,'0')}`;\n}\nfunction localDateTimeUtc(ymd,hour=0,minute=0){\n  const probe=new Date(ymd+'T12:00:00Z');\n  const parts=new Intl.DateTimeFormat('en-US',{timeZone:TZ,timeZoneName:'longOffset',hour:'2-digit'}).formatToParts(probe);\n  const z=parts.find(p=>p.type==='timeZoneName')?.value||'GMT+03:00';\n  const m=z.match(/GMT([+-])(\\d{2}):(\\d{2})/);\n  const off=m?((m[1]==='-'?-1:1)*(Number(m[2])*60+Number(m[3]))):180;\n  return new Date(Date.parse(`${ymd}T${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}:00Z`)-off*60000);\n}\nconst today=ymdInSofia(new Date());\nlet fromYmd,toYmd,label='';\nif(kind==='DAILY'){\n  fromYmd=addDays(today,-1); toYmd=today; label=fromYmd;\n}else if(kind==='WEEKLY'){\n  const noon=new Date(today+'T12:00:00Z');\n  const daysSinceMonday=(noon.getUTCDay()+6)%7;\n  const thisMonday=addDays(today,-daysSinceMonday);\n  fromYmd=addDays(thisMonday,-7); toYmd=thisMonday;\n  label=`${fromYmd} – ${addDays(toYmd,-1)}`;\n}else if(kind==='MONTHLY'){\n  const [y,m]=today.split('-').map(Number);\n  const firstThis=`${y}-${String(m).padStart(2,'0')}-01`;\n  const prevDate=new Date(Date.UTC(y,m-2,1,12));\n  fromYmd=`${prevDate.getUTCFullYear()}-${String(prevDate.getUTCMonth()+1).padStart(2,'0')}-01`;\n  toYmd=firstThis; label=fromYmd.slice(0,7);\n}else throw new Error('FUSION_REPORT_UNKNOWN_KIND_'+kind);\n\n// Reporting day closes at 06:30 Sofia time. Use publication time, not kickoff.\nconst from=localDateTimeUtc(fromYmd,BOUNDARY_HOUR,BOUNDARY_MINUTE);\nconst to=localDateTimeUtc(toYmd,BOUNDARY_HOUR,BOUNDARY_MINUTE);\nconst base=SUPABASE_URL.replace(/\\/$/,'');\nconst url=`${base}/rest/v1/sr_fusion_engine_picks?publication_published_at=gte.${encodeURIComponent(from.toISOString())}&publication_published_at=lt.${encodeURIComponent(to.toISOString())}&telegram_message_id=not.is.null&publication_status=eq.PUBLISHED&select=*`;\nconst res=await this.helpers.httpRequest({method:'GET',url,headers:{apikey:KEY,Authorization:`Bearer ${KEY}`},json:true,returnFullResponse:true,ignoreHttpStatusErrors:true,timeout:20000});\nconst sc=Number(res?.statusCode||0);\nif(sc<200||sc>=300) throw new Error(`FUSION_REPORT_QUERY_FAILED_HTTP_${sc}`);\nconst rows=Array.isArray(res.body)?res.body:[];\nconst finalStates=new Set(['WON','LOSS','PUSH','HALF_WON','HALF_LOST','VOID']);\nconst settled=rows.filter(r=>finalStates.has(String(r.settlement_status||'').toUpperCase()));\nconst stake=settled.filter(r=>String(r.settlement_status||'').toUpperCase()!=='VOID').reduce((s,r)=>s+Number(r.stake||0),0);\nconst pnl=settled.reduce((s,r)=>s+Number(r.pnl||0),0);\nconst counts={}; for(const r of settled){const k=String(r.settlement_status||'').toUpperCase();counts[k]=(counts[k]||0)+1;}\nconst title=kind==='DAILY'?'ДНЕВЕН':kind==='WEEKLY'?'СЕДМИЧЕН':'МЕСЕЧЕН';\nconst wins=(counts.WON||0)+(counts.HALF_WON||0);\nconst losses=(counts.LOSS||0)+(counts.HALF_LOST||0);\nconst extras=(counts.PUSH||0)+(counts.VOID||0);\nconst text=`📊 ${title} ОТЧЕТ · ${label}\n🎯 ${rows.length} сигнала · ✅ ${wins} · ❌ ${losses}${extras?` · ↔️ ${extras}`:''}\n💰 ${pnl>=0?'+':''}${pnl.toFixed(2)} € · ROI ${stake?((pnl/stake)*100).toFixed(1):'0.0'}%`;\nreturn [{json:{report_kind:kind,report_text:text,published_count:rows.length,settled_count:settled.length,pnl:+pnl.toFixed(2),roi:stake?+(pnl/stake*100).toFixed(2):0,from:from.toISOString(),to:to.toISOString(),queryOk:true,reportBoundary:'06:30 Europe/Sofia',reportBasis:'publication_published_at'}}];\n"
+      },
+      "id": "5a3da092-f9a8-4fce-b48c-3cdcf54cf6e7",
+      "name": "MONTHLY · Build Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -528,
+        3072
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "-1003038027412",
+        "text": "={{ $json.report_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "93cc17b8-ebaf-422f-9d5f-fef47ca410ef",
+      "name": "MONTHLY · Telegram Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -256,
+        3072
+      ],
+      "webhookId": "bedcc3a2-8697-48b3-a56b-78a3d9906ba3",
+      "credentials": {
+        "telegramApi": {
+          "id": "HRAZxfaNbMK1280u",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const x=$json||{},d=x.diagnostics||{};\nconst SUPABASE_URL=$env.SUPABASE_URL || 'https://nhgqksizfyumdqmuuznx.supabase.co';\nconst SUPABASE_KEY=$env.SUPABASE_SERVICE_KEY || 'SET_SUPABASE_SECRET_IN_N8N_ENV';\nif(!SUPABASE_URL||!SUPABASE_KEY)return {...x,analyticsPersisted:false,analyticsError:'MISSING_SUPABASE_CONFIG'};\nconst row={\n engine_version:x.engineVersion||'FUSION_ENGINE_V1_5_3_18_PRODUCTION_CLEANUP',observed_at:new Date().toISOString(),\n fixture_id:x.fixture_id==null?null:Number(x.fixture_id),kickoff:x.kickoff||null,home_team:x.home_team||null,\n away_team:x.away_team||null,league:x.league||null,publish:Boolean(x.publish),final_reason:x.reason||null,\n data_quality_score:Number(x.data_quality_score||0),history_score:Number(x.history_score||0),\n history_home_n:Number(x.history_home_n||0),history_away_n:Number(x.history_away_n||0),\n markets_normalized:Number(d.marketsNormalized||0),t30_passed:Number(d.t30Passed||0),odds_passed:Number(d.oddsPassed||0),\n calibration_passed:Number(d.calibrationPassed||0),value_passed:Number(d.valuePassed||0),quality_passed:Number(d.qualityPassed||0),\n market_score_passed:Number(d.marketScorePassed||0),movement_passed:Number(d.movementPassed||0),\n best_markets:Number(d.bestMarkets||0),dedup_passed:Number(d.dedupPassed||0),diagnostics:d\n};\ntry{\n const r=await this.helpers.httpRequest({method:'POST',url:SUPABASE_URL.replace(/\\/$/,'')+'/rest/v1/sr_fusion_engine_funnel_runs',\n headers:{apikey:SUPABASE_KEY,Authorization:`Bearer ${SUPABASE_KEY}`,'Content-Type':'application/json',Prefer:'return=minimal'},\n body:row,json:true,returnFullResponse:true,ignoreHttpStatusErrors:true,timeout:15000});\n const sc=Number(r?.statusCode||0);if(sc<200||sc>=300)throw new Error('HTTP_'+sc);\n return {...x,analyticsPersisted:true};\n}catch(e){return {...x,analyticsPersisted:false,analyticsError:String(e.message||e)};}"
+      },
+      "id": "120358af-fe9c-49f9-ad54-ed925f324e84",
+      "name": "13A · Persist Funnel Analytics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3216,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const x=$json||{};\nconst c=x.candidate||x.selected||{};\nif(!x.publish || !c || !c.market_family){\n  return {...x,text:'',telegramReady:false,telegramBuildReason:'NO_PUBLIC_CANDIDATE'};\n}\nconst n=v=>Number(v);\nconst pct=v=>Number.isFinite(n(v))?(n(v)*100).toFixed(1):'—';\nconst pp=v=>Number.isFinite(n(v))?(n(v)*100).toFixed(1):'—';\nconst dec=v=>Number.isFinite(n(v))?n(v).toFixed(2):'—';\nconst score=v=>Number.isFinite(n(v))?n(v).toFixed(1):'—';\n\nfunction marketLabel(c){\n  const fam=String(c.market_family||'').toUpperCase();\n  const side=String(c.side||'').toUpperCase();\n  const line=Number(c.line);\n  if(fam==='GOALS' && Number.isFinite(line))\n    return `${side==='UNDER'?'Под':'Над'} ${line} гола`;\n  if(fam==='BTTS')\n    return side==='NO'?'Гол/Гол — Не':'Гол/Гол — Да';\n  if(fam==='MONEYLINE'){\n    if(side==='HOME') return 'Победа за домакина';\n    if(side==='AWAY') return 'Победа за госта';\n    if(side==='DRAW') return 'Равен';\n  }\n  if(fam==='DOUBLE_CHANCE'){\n    if(side==='HOME_DRAW'||side==='1X') return 'Двоен шанс 1X';\n    if(side==='AWAY_DRAW'||side==='X2') return 'Двоен шанс X2';\n    if(side==='HOME_AWAY'||side==='12') return 'Двоен шанс 12';\n  }\n  return String(c.market_key||`${fam} ${side}`).replaceAll('_',' ');\n}\n\nconst ko=new Date(c.kickoff||x.kickoff);\nconst time=Number.isFinite(ko.getTime())\n  ? new Intl.DateTimeFormat('bg-BG',{timeZone:'Europe/Sofia',hour:'2-digit',minute:'2-digit',hour12:false}).format(ko)\n  : '—';\n\nconst ev=Number(c.calibrated_ev);\nconst edge=Number(c.calibrated_edge_pp);\nconst evTxt=Number.isFinite(ev)?`${ev>=0?'+':''}${pct(ev)}%`:'—';\nconst edgeTxt=Number.isFinite(edge)?`${edge>=0?'+':''}${pp(edge)} п.п.`:'—';\n\nconst text=[\n '🎯 SOCCER RADAR · FUSION',\n '',\n `⚽️ ${c.home_team||x.home_team} — ${c.away_team||x.away_team}`,\n '',\n `🏆 ${c.league||x.league||'—'}`,\n '',\n `🕒 ${time}`,\n '',\n `📌 ${marketLabel(c)}`,\n '',\n `💰 Bet365: ${dec(c.odd)}`\n].join('\\n');\n\nreturn {...x,text,telegramReady:true,telegramBuildReason:null};"
+      },
+      "id": "d9549f52-2af2-4879-b8aa-856a26b38089",
+      "name": "20A · Build Telegram T-30 Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4096,
+        1888
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst src=$('32A · Claim Telegram Reply').item.json||{};\nconst telegramResult=$json||{};\nconst SUPABASE_URL=$env.SUPABASE_URL || 'https://nhgqksizfyumdqmuuznx.supabase.co';\nconst SUPABASE_KEY=$env.SUPABASE_SERVICE_KEY || 'SET_SUPABASE_SECRET_IN_N8N_ENV';\n\nconst pickId=Number(src.pick_id);\nconst originalMessageId=Number(src.telegram_message_id);\nconst msg=telegramResult?.result ?? telegramResult?.message ?? telegramResult;\nconst sentMessageId=Number(msg?.message_id ?? 0);\nconst actualReplyToId=Number(msg?.reply_to_message?.message_id ?? 0);\n\nif(!Number.isFinite(pickId)||pickId<=0) throw new Error('REPLY_CONFIRM_MISSING_PICK_ID');\nif(!Number.isFinite(originalMessageId)||originalMessageId<=0) throw new Error('REPLY_CONFIRM_MISSING_ORIGINAL_MESSAGE_ID');\nif(!Number.isFinite(sentMessageId)||sentMessageId<=0) throw new Error('REPLY_CONFIRM_TELEGRAM_SUCCESS_NOT_VERIFIED');\n\nconst now=new Date().toISOString();\nconst baseUrl=SUPABASE_URL.replace(/\\/$/,'');\nconst headers={apikey:SUPABASE_KEY,Authorization:`Bearer ${SUPABASE_KEY}`,'Content-Type':'application/json',Prefer:'return=representation'};\n\n// Hard safety: if Telegram sent a message but it was NOT a real reply,\n// quarantine the row so the 15-min recovery loop cannot spam more standalone messages.\nif(actualReplyToId!==originalMessageId){\n  const er=await this.helpers.httpRequest({\n    method:'PATCH',\n    url:`${baseUrl}/rest/v1/sr_fusion_engine_picks?id=eq.${pickId}&settlement_reply_status=neq.SENT`,\n    headers,\n    body:{\n      reply_sent:false,\n      settlement_reply_status:'FAILED_REPLY_SHAPE',\n      settlement_reply_message_id:sentMessageId,\n      reply_claimed_at:null,\n      reply_claim_token:null,\n      settlement_reply_last_error:`Telegram message ${sentMessageId} was sent without expected reply_to_message=${originalMessageId}`\n    },\n    json:true,returnFullResponse:true,ignoreHttpStatusErrors:true\n  });\n  const esc=Number(er?.statusCode||0);\n  if(esc<200||esc>=300) throw new Error('REPLY_SHAPE_QUARANTINE_DB_PATCH_HTTP_'+esc);\n  return [{json:{\n    ...src,\n    replyDeliverySucceeded:false,\n    settlement_reply_status:'FAILED_REPLY_SHAPE',\n    settlement_reply_message_id:sentMessageId,\n    expected_reply_to_message_id:originalMessageId,\n    actual_reply_to_message_id:actualReplyToId||null,\n    reason:'TELEGRAM_SENT_BUT_NOT_AS_REPLY'\n  }}];\n}\n\nconst r=await this.helpers.httpRequest({\n method:'PATCH',\n url:`${baseUrl}/rest/v1/sr_fusion_engine_picks?id=eq.${pickId}&settlement_reply_status=neq.SENT`,\n headers,\n body:{\n   reply_sent:true,\n   reply_sent_at:now,\n   settlement_reply_status:'SENT',\n   settlement_reply_message_id:sentMessageId,\n   settlement_reply_last_error:null,\n   reply_claimed_at:null,\n   reply_claim_token:null\n },\n json:true,returnFullResponse:true,ignoreHttpStatusErrors:true\n});\nconst sc=Number(r?.statusCode||0);\nif(sc<200||sc>=300) throw new Error('REPLY_CONFIRM_DB_PATCH_HTTP_'+sc);\nconst rows=Array.isArray(r.body)?r.body:[];\nif(rows.length!==1) throw new Error('REPLY_CONFIRM_NOT_EXACTLY_ONE_ROW');\n\nreturn [{json:{\n  ...src,\n  replyDeliverySucceeded:true,\n  reply_sent:true,\n  reply_sent_at:now,\n  settlement_reply_status:'SENT',\n  settlement_reply_message_id:sentMessageId,\n  reply_to_message_id_verified:actualReplyToId\n}}];\n"
+      },
+      "id": "e0f90500-0cc9-45eb-9308-a3af3139cc7f",
+      "name": "34 · Confirm Telegram Reply Sent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -48,
+        2176
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\nconst x=$json||{};\nif(x.replyReady!==true)\n  return {...x,replyClaimed:false,replyReady:false,reason:'NOT_REPLY_READY'};\n\nconst SUPABASE_URL=$env.SUPABASE_URL || 'https://nhgqksizfyumdqmuuznx.supabase.co';\nconst KEY=$env.SUPABASE_SERVICE_KEY || 'SET_SUPABASE_SECRET_IN_N8N_ENV';\nconst pickId=Number(x.pick_id);\nconst msgId=Number(x.telegram_message_id);\nconst current=String(x.settlement_reply_status||'PENDING').toUpperCase();\n\nif(!Number.isFinite(pickId)||pickId<=0||!Number.isFinite(msgId)||msgId<=0)\n  return {...x,replyClaimed:false,replyReady:false,reason:'INVALID_REPLY_IDENTITY'};\n\nif(!['PENDING','FAILED'].includes(current))\n  return {...x,replyClaimed:false,replyReady:false,reason:'REPLY_NOT_CLAIMABLE',currentStatus:current};\n\nconst token=`${$execution.id}:${pickId}:${Date.now()}`;\nconst base=SUPABASE_URL.replace(/\\/$/,'');\nconst r=await this.helpers.httpRequest({\n  method:'PATCH',\n  url:`${base}/rest/v1/sr_fusion_engine_picks?id=eq.${pickId}&reply_sent=eq.false&settlement_reply_status=eq.${current}`,\n  headers:{apikey:KEY,Authorization:`Bearer ${KEY}`,'Content-Type':'application/json',Prefer:'return=representation'},\n  body:{settlement_reply_status:'SENDING',reply_claimed_at:new Date().toISOString(),reply_claim_token:token},\n  json:true,returnFullResponse:true,ignoreHttpStatusErrors:true,timeout:15000\n});\nconst sc=Number(r?.statusCode||0);\nif(sc<200||sc>=300) throw new Error(`V6352_REPLY_CLAIM_HTTP_${sc}`);\n\nconst rows=Array.isArray(r.body)?r.body:[];\nif(rows.length!==1)\n  return {...x,replyClaimed:false,replyReady:false,reason:'REPLY_ALREADY_CLAIMED'};\n\nreturn {...x,replyClaimed:true,replyReady:true,reply_claim_token:token,settlement_reply_status:'SENDING'};\n"
+      },
+      "id": "af014047-fc86-451a-8f3e-56b26438fccd",
+      "name": "32A · Claim Telegram Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -528,
+        2176
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "18fb2800-3875-4fa4-9016-350e5a356f88",
+              "leftValue": "={{ $json.replyClaimed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "3663ed41-247c-4cc8-83b0-c7d428ef4bb4",
+      "name": "32B · IF Reply Claimed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -384,
+        2176
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "12,27,42,57 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "d155df65-06ac-4c08-a3fb-b9db72959aae",
+      "name": "40 · Research Audit every 15m · offset 12",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -960,
+        3936
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst SUPABASE_URL=$env.SUPABASE_URL || \"https://nhgqksizfyumdqmuuznx.supabase.co\";\nconst SUPABASE_KEY=$env.SUPABASE_SERVICE_KEY || \"SET_SUPABASE_SECRET_IN_N8N_ENV\";\nconst CHAT_ID='-1003038027412';\nif(!SUPABASE_URL||!SUPABASE_KEY) throw new Error('RESEARCH_AUDIT_SUPABASE_CONFIG_MISSING');\nconst base=SUPABASE_URL.replace(/\\/$/,'');\nconst headers={apikey:SUPABASE_KEY,Authorization:`Bearer ${SUPABASE_KEY}`,'Content-Type':'application/json'};\nasync function req(method,path,body){\n const r=await this.helpers.httpRequest({method,url:base+path,headers,body,json:true,returnFullResponse:true,ignoreHttpStatusErrors:true,timeout:20000});\n const sc=Number(r?.statusCode||0);\n if(sc<200||sc>=300) throw new Error(`RESEARCH_AUDIT_HTTP_${sc}`);\n return r.body;\n}\nconst rows=await req.call(this,'GET',\n \"/rest/v1/sr_fusion_engine_picks?publication_status=eq.PUBLISHED&settlement_status=in.(WON,LOSS,PUSH,HALF_WON,HALF_LOST)&select=id,settlement_status,stake,pnl,odd,calibrated_ev,calibrated_edge_pp,market_family,side,movement_class&order=id.asc\"\n);\nconst a=Array.isArray(rows)?rows:[];\nconst n=a.length;\nconst checkpoint=Math.floor(n/10)*10;\nif(checkpoint<20) return [{json:{auditDue:false,reason:'CHECKPOINT_LT_20',settled:n,checkpoint}}];\nconst sd=$getWorkflowStaticData('global');\nconst last=Number(sd.researchAuditLastCheckpoint||0);\nif(checkpoint<=last) return [{json:{auditDue:false,reason:'ALREADY_SENT',settled:n,checkpoint,last}}];\n\nconst sample=a.slice(0,checkpoint);\nconst sum=(arr,key)=>arr.reduce((s,x)=>s+(Number(x?.[key])||0),0);\nconst stats=arr=>{\n const stake=sum(arr,'stake'), pnl=sum(arr,'pnl');\n return {n:arr.length,pnl:+pnl.toFixed(2),roi:stake?+(pnl/stake*100).toFixed(2):0};\n};\nconst overall=stats(sample);\nconst groups={\n OVER:stats(sample.filter(x=>x.market_family!=='BTTS'&&x.side==='OVER')),\n UNDER:stats(sample.filter(x=>x.market_family!=='BTTS'&&x.side==='UNDER')),\n BTTS:stats(sample.filter(x=>x.market_family==='BTTS'))\n};\nconst evGroups={\n '<5%':stats(sample.filter(x=>Number(x.calibrated_ev)<.05)),\n '5–7.5%':stats(sample.filter(x=>Number(x.calibrated_ev)>=.05&&Number(x.calibrated_ev)<.075)),\n '7.5–10%':stats(sample.filter(x=>Number(x.calibrated_ev)>=.075&&Number(x.calibrated_ev)<.10)),\n '10%+':stats(sample.filter(x=>Number(x.calibrated_ev)>=.10))\n};\nconst moves={\n CONFIRMED:stats(sample.filter(x=>x.movement_class==='CONFIRMED')),\n NEUTRAL:stats(sample.filter(x=>x.movement_class==='NEUTRAL'))\n};\nconst fmt=x=>`${x>=0?'+':''}${Number(x).toFixed(2)}`;\nconst line=(label,s)=>`${label}: N=${s.n} · P/L ${fmt(s.pnl)} € · ROI ${fmt(s.roi)}%`;\nconst avgEv=sample.length?sample.reduce((s,x)=>s+(Number(x.calibrated_ev)||0),0)/sample.length*100:0;\nconst text=[\n `📊 <b>SOCCER RADAR · RESEARCH AUDIT · N=${checkpoint}</b>`,\n '',\n `💰 P/L: <b>${fmt(overall.pnl)} €</b>`,\n `📈 ROI: <b>${fmt(overall.roi)}%</b>`,\n '',\n `⚽ ${line('OVER',groups.OVER)}`,\n `⚽ ${line('UNDER',groups.UNDER)}`,\n `⚽ ${line('BTTS',groups.BTTS)}`,\n '',\n `📊 ${line('EV under 5%',evGroups['<5%'])}`,\n `📊 ${line('EV 5–7.5%',evGroups['5–7.5%'])}`,\n `📊 ${line('EV 7.5–10%',evGroups['7.5–10%'])}`,\n `📊 ${line('EV 10%+',evGroups['10%+'])}`,\n '',\n `📈 ${line('CONFIRMED',moves.CONFIRMED)}`,\n `➖ ${line('NEUTRAL',moves.NEUTRAL)}`,\n '',\n `🧮 Avg predicted EV: ${avgEv.toFixed(2)}%`,\n `🧪 Forward record · Fixed tracking stake €100`\n].join('\\n');\nreturn [{json:{auditDue:true,checkpoint,settled:n,text,chatId:CHAT_ID}}];\n"
+      },
+      "id": "bcd47ebd-4a82-4b04-9ee9-3174cc9aede4",
+      "name": "41 · Build Research Audit · every 10 settled",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -656,
+        3936
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ab39ad94-c169-4ff9-93d7-4cce03a848ca",
+              "leftValue": "={{ $json.auditDue }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "aa07a560-aaaf-4d9c-b0e1-2816be824ec3",
+      "name": "42 · IF Research Audit Due?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -336,
+        3936
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst out=[];\nconst finite=x=>Number.isFinite(Number(x));\nconst clamp=(x,a,b)=>Math.max(a,Math.min(b,x));\nconst sigmoid=z=>1/(1+Math.exp(-z));\n\nfor(const it of items){\n const x=it.json||{};\n const raw=Array.isArray(x.candidates)?x.candidates:[];\n const arr=raw.filter(q=>['GOALS','BTTS','MONEYLINE'].includes(String(q.market_family||'').toUpperCase()));\n const scored=[];\n for(const q of arr){\n   const f=q.fusion_features||x.fusion_features||{};\n   const fam=String(q.market_family||'').toUpperCase();\n   const side=String(q.side||'').toUpperCase();\n   const line=q.line==null?null:Number(q.line);\n   const parts=[];\n   const missing=[];\n\n   // A) Poisson/DC + calibration core, independent of the old MarketScore gate.\n   const cp=finite(q.model_probability_calibrated)?Number(q.model_probability_calibrated):\n            (finite(q.model_probability)?Number(q.model_probability):null);\n   const mp=finite(q.market_probability)?Number(q.market_probability):(finite(q.odd)?1/Number(q.odd):null);\n   const dq=finite(x.data_quality_score)?Number(x.data_quality_score):0;\n   const hs=finite(x.history_score)?Number(x.history_score):0;\n   let core=50;\n   if(cp!=null && mp!=null) core=50+(cp-mp)*180;\n   core=0.70*core+0.15*dq+0.15*hs;\n   parts.push({name:'POISSON_DC_CALIBRATED',available:cp!=null,weight:0.40,score:clamp(core,0,100),\n     evidence:{calibrated_probability:cp,market_probability:mp,data_quality:dq,history_score:hs}});\n\n   // B) Uploaded TB2.5 algorithm: BP/FP/IPT with exact 60/40 weighting and 2.70 Over threshold.\n   if(finite(f.ipt) && fam==='GOALS'){\n      const ipt=Number(f.ipt);\n      let s=50;\n      if(side==='OVER') s=50+(ipt-2.70)*24;\n      else if(side==='UNDER') s=50+(2.70-ipt)*24;\n      // strongest relevance around 2.5; adjacent Asian lines retain partial influence.\n      const rel=line==null?0.5:clamp(1-Math.abs(line-2.5)*0.35,0.55,1);\n      parts.push({name:'IPT_60_40',available:true,weight:0.20,score:clamp(50+(s-50)*rel,0,100),\n        evidence:{ipt:f.ipt,bp:f.bp,fp:f.fp}});\n   } else {missing.push('IPT_60_40');}\n\n   // C) GPM / attack-defense goal potential from available lambda and recent venue GF/GA.\n   if(finite(f.lambda_total) && fam==='GOALS'){\n      const lt=Number(f.lambda_total);\n      const pivot=line??2.5;\n      let s=side==='OVER'?50+(lt-pivot)*18:50+(pivot-lt)*18;\n      parts.push({name:'GPM_ATTACK_DEFENCE',available:true,weight:0.15,score:clamp(s,0,100),\n        evidence:{lambda_total:lt,home_gf5:f.home_gf_last5,away_gf5:f.away_gf_last5}});\n   } else if(fam==='BTTS' && finite(f.home_gf_last5)&&finite(f.away_gf_last5)&&finite(f.home_ga_last5)&&finite(f.away_ga_last5)){\n      const yesEnv=(Number(f.home_gf_last5)+Number(f.away_gf_last5)+Number(f.home_ga_last5)+Number(f.away_ga_last5))/4;\n      let s=50+(yesEnv-1.15)*22;\n      if(side==='NO') s=100-s;\n      parts.push({name:'GPM_ATTACK_DEFENCE',available:true,weight:0.15,score:clamp(s,0,100),\n        evidence:{btts_goal_environment:yesEnv}});\n   } else missing.push('GPM_ATTACK_DEFENCE');\n\n   // C2) MONEYLINE-specific independent match-result evidence.\n   // Uses model/venue scoring inputs only; calibrated EV/edge remain excluded from Fusion Score.\n   if(fam==='MONEYLINE'){\n      const lh=finite(f.lambda_home)?Number(f.lambda_home):null;\n      const la=finite(f.lambda_away)?Number(f.lambda_away):null;\n      if(lh!=null && la!=null){\n        const diff=lh-la;\n        const total=lh+la;\n        let s=50;\n        if(side==='HOME') s=50+diff*24;\n        else if(side==='AWAY') s=50-diff*24;\n        else if(side==='DRAW') s=66-Math.abs(diff)*28-Math.abs(total-2.35)*5;\n        parts.push({name:'RESULT_LAMBDA_BALANCE',available:true,weight:0.20,score:clamp(s,0,100),\n          evidence:{lambda_home:lh,lambda_away:la,lambda_diff:diff,lambda_total:total}});\n      } else missing.push('RESULT_LAMBDA_BALANCE');\n\n      const hgf=finite(f.home_gf_last5)?Number(f.home_gf_last5):null;\n      const hga=finite(f.home_ga_last5)?Number(f.home_ga_last5):null;\n      const agf=finite(f.away_gf_last5)?Number(f.away_gf_last5):null;\n      const aga=finite(f.away_ga_last5)?Number(f.away_ga_last5):null;\n      if(hgf!=null&&hga!=null&&agf!=null&&aga!=null){\n        const homeNet=hgf-hga, awayNet=agf-aga, venueDiff=homeNet-awayNet;\n        let s=50;\n        if(side==='HOME') s=50+venueDiff*18;\n        else if(side==='AWAY') s=50-venueDiff*18;\n        else if(side==='DRAW') s=68-Math.abs(venueDiff)*24;\n        parts.push({name:'VENUE_FORM_RESULT',available:true,weight:0.15,score:clamp(s,0,100),\n          evidence:{home_net:homeNet,away_net:awayNet,venue_diff:venueDiff}});\n      } else missing.push('VENUE_FORM_RESULT');\n   }\n\n   // D) Uploaded BTTS filter, using only the components actually available.\n   // Standings are mandatory in the source, therefore full BTTS-filter weight is not fabricated.\n   if(fam==='BTTS'){\n      const partialAvailable=finite(f.draw_odd)&&finite(f.home_gf_last5)&&finite(f.away_gf_last5)&&finite(f.home_ga_last5)&&finite(f.away_ga_last5);\n      if(partialAvailable){\n        const fav=Math.min(Number(f.home_odd||99),Number(f.away_odd||99));\n        const dog=Math.max(Number(f.home_odd||0),Number(f.away_odd||0));\n        let hits=0,total=6;\n        if(Number(f.draw_odd)>=3.7) hits++;\n        if(Number(f.home_gf_last5)>=1.1) hits++;\n        if(Number(f.away_gf_last5)>=1.1) hits++;\n        if(Number(f.under25_count_last10)<=3) hits++;\n        if(fav<2) hits++;\n        if(dog>2&&dog<4) hits++;\n        let s=100*hits/total;\n        if(side==='NO') s=100-s;\n        // partial evidence only: lower weight because standings requirement is unavailable.\n        parts.push({name:'BTTS_FILTER_PARTIAL',available:true,weight:0.05,score:clamp(s,0,100),\n          evidence:{hits,total,standings_missing:true}});\n        missing.push('BTTS_FILTER_STANDINGS');\n      } else missing.push('BTTS_FILTER');\n   }\n\n   // D2) v1.5.1 H2H_CONTEXT — FULL at >=5; PARTIAL at 2-4 with reduced weight.\n   // It is market-specific and independent from the team attack/defence sample.\n   const hc=q.history_context||{};\n   const hr=Array.isArray(hc.h2h_results)?hc.h2h_results:[];\n   if(hr.length>=2){\n     let evidenceSum=0,total=0,hits=0;\n     const splitHistLine=L=>{const ql=Math.round(Number(L)*4)/4;return Math.abs(ql*2-Math.round(ql*2))>1e-9?[Math.floor(ql*2)/2,Math.ceil(ql*2)/2]:[ql];};\n     const histLeg=v=>v>1e-12?1:v<-1e-12?-1:0;\n     for(const r of hr){\n       const hg=Number(r.home_goals),ag=Number(r.away_goals);\n       if(!finite(hg)||!finite(ag))continue;\n       let value=null;\n       if(fam==='BTTS'){\n         const yes=hg>0&&ag>0; value=((side==='YES')===yes)?1:-1;\n       } else if(fam==='GOALS' && finite(line)){\n         const tg=hg+ag, legs=splitHistLine(line);\n         value=legs.reduce((s,L)=>s+histLeg(side==='OVER'?tg-L:L-tg),0)/legs.length;\n       } else if(fam==='MONEYLINE'){\n         const homeId=Number(r.home_id),awayId=Number(r.away_id);\n         const curHomeId=Number(q.home_team_id||x.home_team_id||0),curAwayId=Number(q.away_team_id||x.away_team_id||0);\n         let ch=null,ca=null;\n         if(homeId===curHomeId&&awayId===curAwayId){ch=hg;ca=ag;}\n         else if(homeId===curAwayId&&awayId===curHomeId){ch=ag;ca=hg;}\n         if(ch!=null){const ok=side==='HOME'?ch>ca:side==='AWAY'?ca>ch:ch===ca;value=ok?1:-1;}\n       }\n       if(value!==null){total++;evidenceSum+=value;if(value>0)hits++;}\n     }\n     if(total>=2){\n       const avgResult=evidenceSum/total, hw=total>=5?0.10:0.04;\n       parts.push({name:'H2H_CONTEXT',available:true,weight:hw,score:clamp(50+avgResult*50,0,100),\n         evidence:{matches:total,positive_results:hits,average_settlement_result:avgResult,tier:total>=5?'FULL':'PARTIAL',full_weight_min:5,asian_settlement_aware:fam==='GOALS'}});\n     } else missing.push('H2H_CONTEXT_MARKET_MAPPING');\n   } else missing.push('H2H_CONTEXT');\n\n   // E) v1.4.2: VALUE IS NOT PART OF THE FUSION SCORE.\n   // calibrated_ev / calibrated_edge_pp are intentionally excluded here.\n   // This prevents the later value gate from validating EV with a score that already contains EV.\n\n   // Unsupported prompt inputs remain explicit missing data; no synthetic scores.\n   for(const z of ['INJURIES','WEATHER','PLAYER_IMPACT','LIVE_DMI','COHESION','STYLE_MATCHUP','MOTIVATION'])\n      missing.push(z);\n\n   const w=parts.reduce((s,p)=>s+p.weight,0);\n   const fusionScore=w?parts.reduce((s,p)=>s+p.weight*p.score,0)/w:0;\n\n   // v1.4.3 EVIDENCE-AWARE FUSION:\n   // Availability is not the same as independent confirmation.\n   // Scores in the neutral band [45,55] remain in Fusion Score/diagnostics,\n   // but do NOT count as directional evidence.\n   const sourceCount=parts.length;\n   const confirmingParts=parts.filter(p=>Number(p.score)>55);\n   const opposingParts=parts.filter(p=>Number(p.score)<45);\n   const neutralParts=parts.filter(p=>Number(p.score)>=45 && Number(p.score)<=55);\n   const confirmingCount=confirmingParts.length;\n   const directionalCount=confirmingParts.length+opposingParts.length;\n   const confirmingWeight=confirmingParts.reduce((s,p)=>s+Number(p.weight||0),0);\n\n   // Require at least one genuinely confirming component in addition to the\n   // overall Fusion threshold. Do not fabricate a 3-source confirmation from\n   // neutral 50-ish components. EV/value remains a separate downstream gate.\n   const evidenceFamilyOf=(name)=>{\n     if(['POISSON_DC_CALIBRATED','GPM_ATTACK_DEFENCE','RESULT_LAMBDA_BALANCE'].includes(name))return 'MODEL_CORE';\n     if(['IPT_60_40','VENUE_FORM_RESULT'].includes(name))return 'TEAM_HISTORY';\n     if(name==='H2H_CONTEXT')return 'H2H_CONTEXT';\n     if(name==='BTTS_FILTER_PARTIAL')return 'MARKET_STRUCTURE';\n     return name;\n   };\n   const confirmingFamilies=[...new Set(confirmingParts.map(p=>evidenceFamilyOf(p.name)))];\n   const availableFamilies=[...new Set(parts.map(p=>evidenceFamilyOf(p.name)))];\n   const evidencePassed=confirmingFamilies.length>=2 || (confirmingFamilies.length>=1 && confirmingWeight>=0.50);\n   const q2={...q,\n     fusion_score:fusionScore,\n     fusion_source_count:sourceCount,\n     fusion_confirming_count:confirmingCount,\n     fusion_confirming_family_count:confirmingFamilies.length,\n     fusion_confirming_families:confirmingFamilies,\n     fusion_available_families:availableFamilies,\n     fusion_directional_count:directionalCount,\n     fusion_confirming_weight:confirmingWeight,\n     fusion_neutral_count:neutralParts.length,\n     fusion_opposing_count:opposingParts.length,\n     fusion_components:parts.map(p=>({...p,\n       evidence_class:Number(p.score)>55?'CONFIRMING':(Number(p.score)<45?'OPPOSING':'NEUTRAL')\n     })),\n     fusion_missing_inputs:[...new Set(missing)],\n     fusion_evidence_passed:evidencePassed,\n     fusion_passed:sourceCount>=3 && fusionScore>=60 && evidencePassed\n   };\n   scored.push(q2);\n }\n const passed=scored.filter(q=>q.fusion_passed===true).map(q=>{\n   const prior=finite(q.market_score)?Number(q.market_score):50;\n   return {...q,\n     pre_fusion_market_score:prior,\n     market_score:0.55*Number(q.fusion_score||0)+0.45*prior\n   };\n });\n out.push({json:{...x,candidates:passed,\n   fusionRawInput:raw.length,\n   fusionExcludedFamily:raw.length-arr.length,\n   fusionInput:arr.length,\n   fusionPassed:passed.length,\n   fusionRejected:{LOW_SCORE:scored.filter(q=>q.fusion_source_count>=3&&q.fusion_score<60).length,\n                   INSUFFICIENT_SOURCES:scored.filter(q=>q.fusion_source_count<3).length,\n                   NO_CONFIRMING_EVIDENCE:scored.filter(q=>q.fusion_source_count>=3&&q.fusion_score>=60&&!q.fusion_evidence_passed).length},\n   fusionAudit:scored.map(q=>({\n      market_family:q.market_family,market_key:q.market_key,side:q.side,line:q.line,\n      odd:q.odd,fusion_score:q.fusion_score,fusion_source_count:q.fusion_source_count,\n      fusion_confirming_count:q.fusion_confirming_count,fusion_neutral_count:q.fusion_neutral_count,\n      fusion_opposing_count:q.fusion_opposing_count,fusion_evidence_passed:q.fusion_evidence_passed,\n      fusion_passed:q.fusion_passed,pre_fusion_market_score:Number(q.market_score||0)\n   }))\n }});\n}\nreturn out;\n"
+      },
+      "id": "7e79648d-c528-4dcb-adba-f87178961e7c",
+      "name": "10F · Unified Fusion Score · ALL STRATEGIES",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2192,
+        1888
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## FUSION ENGINE v1.2.2 · DISCOVERY WINDOW HOTFIX\n\nOnly discovery timing changed; Fusion mathematics unchanged.\n\nNode 01 discovery window:\n- before: T-20 to T-50\n- now: T-10 to T-50\n\nNode 03 remains the final T-30 publication-window authority.\n\nThis prevents boundary/clock drift from dropping a scheduled fixture reported around T-20 before it reaches the model.\nGOALS + BTTS policy unchanged.\nWorkflow imported inactive; enable Active after import."
+      },
+      "id": "31dbcb55-bab7-4c7f-90b1-4359b9d26da3",
+      "name": "FUSION ENGINE v1.2.2 · DISCOVERY HOTFIX NOTE",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1968,
+        1504
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "25 6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "389b6f2d-eccd-4f97-9266-d549d78f0494",
+      "name": "45 · Daily Funnel 06:25 · Rolling 24h",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1056,
+        2832
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const SUPABASE_URL=$env.SUPABASE_URL || 'https://nhgqksizfyumdqmuuznx.supabase.co';\nconst SUPABASE_KEY=$env.SUPABASE_SERVICE_KEY || 'SET_SUPABASE_SECRET_IN_N8N_ENV';\nif(!SUPABASE_URL||!SUPABASE_KEY) throw new Error('MISSING_SUPABASE_CONFIG');\nconst end=new Date(), start=new Date(end.getTime()-24*60*60*1000);\nconst url=SUPABASE_URL.replace(/\\/$/,'')+'/rest/v1/sr_fusion_engine_funnel_runs?observed_at=gte.'+encodeURIComponent(start.toISOString())+'&observed_at=lt.'+encodeURIComponent(end.toISOString())+'&select=fixture_id,publish,final_reason,diagnostics,observed_at';\nconst r=await this.helpers.httpRequest({method:'GET',url,headers:{apikey:SUPABASE_KEY,Authorization:`Bearer ${SUPABASE_KEY}`},json:true,returnFullResponse:true,ignoreHttpStatusErrors:true,timeout:20000});\nif(Number(r.statusCode||0)<200||Number(r.statusCode||0)>=300) throw new Error('FUNNEL_REPORT_HTTP_'+r.statusCode);\nconst rows=Array.isArray(r.body)?r.body:[];\nconst by=new Map();\nfor(const row of rows){const k=String(row.fixture_id??'NULL_'+row.observed_at); const prev=by.get(k); if(!prev||String(row.observed_at)>String(prev.observed_at))by.set(k,row)}\nconst u=[...by.values()];\nconst max=(fn)=>u.reduce((s,x)=>s+(fn(x)?1:0),0);\nconst stage=(k)=>max(x=>Number(x?.diagnostics?.[k]||0)>0);\nconst reasons={}; for(const x of u){if(x.publish)continue;const z=x.final_reason||'UNKNOWN';reasons[z]=(reasons[z]||0)+1}\nconst top=Object.entries(reasons).sort((a,b)=>b[1]-a[1]).slice(0,6);\nconst discovered=Math.max(0,...u.map(x=>Number(x?.diagnostics?.discovery?.fixtures_fetched||0)));\nconst watched=Math.max(0,...u.map(x=>Number(x?.diagnostics?.discovery?.fixtures_in_watch_window||0)));\nconst published=max(x=>x.publish===true);\nconst lines=['📊 FUSION ENGINE · DAILY FUNNEL · 24H','',`🌍 Discovery max/run: ${discovered}`,`🎯 Watch-window max/run: ${watched}`,`⚽ Unique analysed fixtures: ${u.length}`,`📈 With normalized markets: ${stage('marketsNormalized')}`,`⏱ T20–T50 passed: ${stage('t30Passed')}`,`💰 Odds gate passed: ${stage('oddsPassed')}`,`🧮 Calibration passed: ${stage('calibrationPassed')}`,`🧱 Quality passed: ${stage('qualityPassed')}`,`🧬 Fusion passed: ${stage('fusionPassed')}`,`💎 Fusion value passed: ${stage('fusionValuePassed')}`,`📣 Published: ${published}`,'','Top no-signal reasons:',...(top.length?top.map(([k,v])=>`• ${k}: ${v}`):['• none'])];\nreturn [{json:{report_text:lines.join('\\n'),rows:rows.length,unique_fixtures:u.length}}];"
+      },
+      "id": "060328e5-5c50-4477-bf68-8dffda838337",
+      "name": "45A · Build Daily Funnel Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -752,
+        2832
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "-1003038027412",
+        "text": "={{ $json.report_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "5b5af960-c00e-424e-ad50-8d8a0048440c",
+      "name": "45B · Telegram Daily Funnel",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -448,
+        2832
+      ],
+      "webhookId": "60eee645-d2e8-4542-9ffa-6981883a69c3",
+      "credentials": {
+        "telegramApi": {
+          "id": "HRAZxfaNbMK1280u",
+          "name": "Telegram account"
+        }
+      },
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "content": "## FUSION ENGINE v1.3.2 · DIAGNOSTIC FUNNEL\n\nDiagnostic/observability release. Prediction thresholds are unchanged from v1.3.1.\n\nAdded:\n- Bet365 response/market/candidate diagnostics in Node 02;\n- exact terminal no-signal reason instead of generic NO_T30_SIGNAL;\n- discovery metadata propagated into funnel diagnostics;\n- daily rolling-24h funnel report at 06:25 to the test Telegram channel;\n- friendlies/international matches remain eligible and are measured by league.\n\nNo SQL migration required: extended diagnostics are stored in the existing JSONB diagnostics field.",
+        "height": 300,
+        "width": 560
+      },
+      "id": "36f9c626-8408-432d-9fc7-4549fd47a159",
+      "name": "FUSION ENGINE v1.3.2 · DIAGNOSTIC FUNNEL NOTE",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        5408,
+        1504
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## FUSION ENGINE v1.4.2 · INDEPENDENT VALUE CORRECTION\n\nProduction correction based on audit of the settled-signal architecture.\n\nChanges:\n- Fusion Score no longer contains calibrated EV / edge.\n- Fusion probability is no longer manufactured from market probability + Fusion Score.\n- Fusion EV now equals the independently calculated calibrated EV.\n- GOALS keeps settlement-aware Asian/quarter-line EV mathematics from the model layer.\n- BTTS uses calibrated binary probability EV.\n- Value gate: GOALS EV >= 4%, BTTS EV >= 3.5%, edge >= 2 pp, odds 1.65–2.15.\n- Existing quality, history, movement, cross-market separation, duplicate guard, settlement and Telegram logic remain intact.\n\nReason: v1.3.3 used Fusion Score to create fusion_probability and then fusion_ev, while Fusion Score itself contained MARKET_VALUE. That created circular confirmation. v1.4.2 removes that loop.\n\nNo OVER/UNDER ban was introduced because the settled sample is too small for a defensible side-specific production rule."
+      },
+      "id": "efe97766-4e34-42cc-8d48-e467a358ee82",
+      "name": "FUSION ENGINE v1.4.2 · INDEPENDENT VALUE FIX",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2208,
+        1584
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## n8n 2.15 compatibility hotfix\n`13A · Persist Funnel Analytics` is **Run Once for Each Item** and now returns a plain object instead of an array-wrapped `{json: ...}` item. This fixes `A 'json' property isn't an object [item 0]`. Prediction, gates, settlement and Telegram logic are unchanged.",
+        "height": 240,
+        "width": 620
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "4f02288f-c2c3-4096-b13d-a37ea7fd9403",
+      "name": "n8n 2.15 · 13A Return Shape Fix"
+    },
+    {
+      "parameters": {
+        "content": "## n8n 2.15 FULL COMPAT AUDIT\nAll Code nodes in **Run Once for Each Item** were audited for n8n 2.15 return shape. They now return the item object directly, not `{json: ...}` or `[{json: ...}]`. Prediction/Fusion/EV logic is unchanged.",
+        "height": 220,
+        "width": 520
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -896,
+        608
+      ],
+      "id": "15bbed5a-b447-439b-a43b-b9f537ca9690",
+      "name": "n8n 2.15 FULL COMPAT AUDIT"
+    },
+    {
+      "parameters": {
+        "content": "## FUSION ENGINE v1.5.0 · EVIDENCE-AWARE FUSION\n\n- Neutral Fusion components (score 45–55) remain visible and remain in the weighted Fusion Score, but no longer count as directional confirmation.\n- Adds `fusion_confirming_count`, `fusion_neutral_count`, `fusion_opposing_count`, `fusion_confirming_weight`, and per-component `evidence_class`.\n- `fusion_passed` still requires >=3 available components and Fusion Score >=60, plus >=1 genuinely confirming component (>55).\n- EV/value remains independent and downstream; no EV/edge is reintroduced into Fusion Score.\n- No daily cap, no combo markets, multiple qualified markets per fixture remain allowed.\n- n8n 2.15 compatibility fixes retained.",
+        "height": 360,
+        "width": 620
+      },
+      "id": "7220f0c9-665e-4798-9139-e6720764d354",
+      "name": "NOTE · v1.4.3 EVIDENCE-AWARE",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1808,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## FUSION ENGINE v1.5.0 · HISTORY-FIRST MULTI-MARKET\n\nProduction policy:\n- Public candidates require >=10 usable historical matches for EACH team.\n- Public candidates require >=5 finished H2H meetings. This gate applies to GOALS, BTTS and MONEYLINE.\n- H2H_CONTEXT becomes a market-specific Fusion component only when >=5 direct meetings are available.\n- Evidence is grouped into families so Poisson/GPM derivatives do not masquerade as fully independent confirmations.\n- Operational watch window widened to T-20..T-90 and model batch to 12 fixtures/run.\n- Price gate widened slightly to 1.60..2.25; EV/edge thresholds are unchanged.\n- No forced quota and no daily cap. Target volume is observational, not guaranteed.\n- No combo markets. No synthetic odds.\n",
+        "height": 380,
+        "width": 650
+      },
+      "id": "2efaf527-88f6-4362-bb2b-514ea8ec8d9e",
+      "name": "NOTE · v1.5 HISTORY-FIRST",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -3600,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## FUSION ENGINE v1.5.2 · DUAL-SOURCE HISTORY · AUDITED\n\nAudit corrections:\n- API-Football Free budget counts every attempted HTTP request; diagnostics distinguish success/error/budget skip.\n- Team resolution is fail-closed: no first-result fallback; only one exact normalized team-name match is accepted.\n- H2H cache validates the stored team-name pair and API team IDs before reuse.\n- H2H is FULL at >=5, PARTIAL at 2-4, NONE at 0-1; it is not a hard publication requirement.\n- Asian GOALS H2H evidence is quarter-line settlement-aware (full/half/push semantics), not simple total > line.\n- Node 13 engine/reason strings corrected to v1.5.2.\n- Primary 10+10 team history remains 5Dollar; API-Football Free is a budgeted H2H verifier/fallback only.\n\nWorkflow intentionally imports inactive. Manual runtime validation required before autopilot."
+      },
+      "id": "3e593aba-60f6-4cdd-9e39-aa428eb3ab36",
+      "name": "FUSION ENGINE v1.5.2 · AUDIT NOTE",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        6000,
+        1504
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## FUSION ENGINE v1.5.3 · SMART H2H RESOLVER · AUDITED\n\nTargeted runtime correction after real Fortaleza–Athletic Club MG test.\n\n- API-Football team resolver is no longer exact-name-only.\n- Name normalization ignores common club suffix tokens and accents.\n- Country context is taken from provider metadata or inferred conservatively from league name.\n- Auto-match requires exact+context or high confidence >=0.90 with separation margin >=0.08; otherwise fail-closed.\n- Resolver diagnostics are stored in history_context.h2h_resolver.\n- Resolved API team IDs remain cached with H2H data.\n- Normalization now exposes normalization_rejected_detail[].\n- Existing MONEYLINE odds gate 1.55–2.20 remains authoritative; no duplicate longshot rule added.\n- No EV thresholds, H2H tier weights, duplicate protection, Telegram, settlement or report policy changed.\n- Workflow imports inactive for manual validation first.",
+        "height": 420,
+        "width": 650
+      },
+      "id": "b5cc7ab6-f29c-47f7-9e01-9f4aba37d875",
+      "name": "FUSION ENGINE v1.5.3 · SMART H2H RESOLVER NOTE",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        6000,
+        1504
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## FUSION ENGINE v1.5.3.4 · API-FOOTBALL TEAM RESOLVER FIX\n\nTargeted fix from real API-Football diagnostics:\n- `/teams?search=` is now called WITHOUT `country`, because API-Football rejects Search + Country together.\n- Country is retained only for local response disambiguation/scoring.\n- Resolver remains fail-closed: exact context match or high-confidence match with separation margin; ambiguous matches are rejected.\n- Existing H2H fallback threshold, Free-plan budget, cache, market models, EV gates, Telegram, settlement and duplicate protection are unchanged.\n- Manual n8n runtime validation required before autopilot.",
+        "height": 340,
+        "width": 650
+      },
+      "id": "fa02dc5f-e0eb-4a48-9fd8-4aa3a4351992",
+      "name": "FUSION ENGINE v1.5.3.4 · RESOLVER FIX NOTE",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        6704,
+        1504
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## v1.5.3.8 · UNIQUE COUNTRY ALIAS + CACHE\nConservative same-country subset alias resolution for renamed clubs; persists verified mapping in sr_fusion_team_map. Global fuzzy thresholds unchanged."
+      },
+      "id": "a2a67ed1-c99f-4057-b844-d841b3d34c21",
+      "name": "CONTROL NOTE · v1.5.3.7 VERIFIED ALIAS TEAM MAP",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -752,
+        1200
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## v1.5.3.10 · FREE H2H COMPAT\nAPI-Football Free compatibility: `/fixtures/headtohead` is called without the paid `last` parameter. Returned fixtures are sorted locally by kickoff date; final H2H keeps the latest 10 and borderline alias verification keeps the latest 3. Resolver, cache, models, EV, publication and settlement policy are otherwise unchanged.",
+        "height": 220,
+        "width": 520
+      },
+      "id": "54625180-410b-45e6-a733-4f03198a108d",
+      "name": "v1.5.3.10 · FREE H2H COMPAT",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        7200,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## v1.5.3.12 · MULTI-ITEM PIPELINE FIX\n\nFixes n8n item handling after the model node. The per-fixture gates that used `$json` now run explicitly once per item with n8n 2.15-compatible direct-object returns. Node 13 remains all-items and explicitly iterates `$input.all()` so all fixtures reach diagnostics/signals. Strategy thresholds, model, EV, Fusion, H2H, Bet365, persistence, Telegram and settlement logic are unchanged."
+      },
+      "id": "1ef72de1-a550-404f-9f83-1625fed8ad5b",
+      "name": "CONTROL NOTE · v1.5.3.12 MULTI-ITEM FIX",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -352,
+        1760
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## v1.5.3.14 · MINIMAL TELEGRAM\n\n- Daily Funnel remains internal only; Telegram delivery disabled.\n- Daily / Weekly / Monthly public reports reduced to 3 lines.\n- Main betting signals, model, EV, Fusion, H2H, settlement and persistence are unchanged.\n- Research audit remains internal: no Telegram research-audit post or public research-audit checkpoint.\n\n\n## v1.5.3.17 · COMPLETE 5DOLLAR COVERAGE\n- Discovery walks /v1/fixtures page-by-page until provider pagination.has_more=false.\n- per_page=100; fixed 24h scheduled-fixture window retained.\n- Fixture IDs are deduplicated before T-20..T-90 watch filtering.\n- Coverage diagnostics expose complete/providerHasMoreAtStop/emergencyLimitReached.\n- Emergency ceiling 100 pages exists only to stop pathological provider pagination loops.\n- Prediction, history, H2H, Fusion, EV, Bet365 markets, persistence, settlement, Telegram and HT research logic are unchanged."
+      },
+      "id": "07e3629e-90ff-4873-b6c8-a5e43fd77bff",
+      "name": "CONTROL NOTE · v1.5.3.17 COMPLETE 5DOLLAR COVERAGE",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        5200,
+        2704
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Independent research side branch. Does not change the main publication path.\nconst src=$json||{};\nconst h=src.ht_research||{};\nif(!h.market_present||![0.5,1.5].includes(Number(h.line))||!(Number(h.over_odd)>1))\n return {research_saved:false,reason:!h.market_present?'NO_HT_MARKET':'NO_SUPPORTED_HT_OVER_PRICE',fixture_id:src.fixture_id};\nconst base=$env.SUPABASE_URL || 'https://nhgqksizfyumdqmuuznx.supabase.co';\nconst key=$env.SUPABASE_SERVICE_KEY || 'SET_SUPABASE_SECRET_IN_N8N_ENV';\nif(!base||!key)return {research_saved:false,reason:'SUPABASE_ENV_NOT_SET',fixture_id:src.fixture_id};\nconst record={fixture_id:Number(src.fixture_id),kickoff:src.kickoff,home_team:src.home_team,away_team:src.away_team,league:src.league,\n market_family:'FIRST_HALF_GOALS',market_key:`HT_OVER_${Number(h.line)}`,side:'OVER',line:Number(h.line),odd:Number(h.over_odd),\n opening_odd:h.opening_over_odd??null,source:'BET365',model_status:'PENDING_VERIFIED_HT_HISTORY',\n snapshot_at:new Date().toISOString(),raw_market:h};\nif(!Number.isFinite(record.fixture_id)||!record.kickoff)return {research_saved:false,reason:'INVALID_FIXTURE',fixture_id:src.fixture_id};\ntry{\n await this.helpers.httpRequest({method:'POST',url:base.replace(/\\/$/,'')+'/rest/v1/sr_fusion_ht_research?on_conflict=fixture_id%2Cmarket_key',\n headers:{apikey:key,Authorization:`Bearer ${key}`,Prefer:'resolution=ignore-duplicates,return=minimal','Content-Type':'application/json'},\n body:record,json:true,ignoreHttpStatusErrors:false,timeout:12000});\n return {research_saved:true,fixture_id:record.fixture_id,market_key:record.market_key,odd:record.odd,research_only:true};\n}catch(e){return {research_saved:false,reason:'DB_WRITE_FAILED',error:String(e.message||e).slice(0,220),fixture_id:src.fixture_id};}"
+      },
+      "id": "007b4112-1f7c-49ef-b1a5-c87ceb09dc07",
+      "name": "HTR · Capture Bet365 1H Market · RESEARCH ONLY",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -304,
+        2560
+      ],
+      "notes": "Capture real Bet365 HT Over 0.5 / 1.5 when actually supplied. No FT-to-HT probability conversion. Requires SQL table and SUPABASE_URL / SUPABASE_SERVICE_KEY env. Does not post Telegram."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "02 · Normalize Real Bet365 Markets": {
+      "main": [
+        [
+          {
+            "node": "03 · T-30 Time Window Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "03 · T-30 Time Window Gate": {
+      "main": [
+        [
+          {
+            "node": "04 · Odds Range Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "04 · Odds Range Gate": {
+      "main": [
+        [
+          {
+            "node": "05 · Probability + Calibration Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "05 · Probability + Calibration Gate": {
+      "main": [
+        [
+          {
+            "node": "07 · Data Quality + History Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "07 · Data Quality + History Gate": {
+      "main": [
+        [
+          {
+            "node": "10F · Unified Fusion Score · ALL STRATEGIES",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 · Market Movement Gate": {
+      "main": [
+        [
+          {
+            "node": "10 · Cross-Market Quality Pass-Through",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "13 · Build Final T-30 Signal + Diagnostics": {
+      "main": [
+        [
+          {
+            "node": "13A · Persist Funnel Analytics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "14 · IF Final Signal?": {
+      "main": [
+        [
+          {
+            "node": "15 · FINAL Fixture Status Recheck",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "15 · FINAL Fixture Status Recheck": {
+      "main": [
+        [
+          {
+            "node": "15A · IF Fixture Still Scheduled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "15A · IF Fixture Still Scheduled?": {
+      "main": [
+        [
+          {
+            "node": "20 · Persist T-30 Pick",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "01 · Independent Upcoming Fixture Discovery": {
+      "main": [
+        [
+          {
+            "node": "02 · TRUE Independent History + Model + Bet365",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "21 · Telegram Publish T-30": {
+      "main": [
+        [
+          {
+            "node": "22 · Save Telegram Message ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "31 · Settlement Engine": {
+      "main": [
+        [
+          {
+            "node": "32 · IF Reply Available?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "32 · IF Reply Available?": {
+      "main": [
+        [
+          {
+            "node": "32A · Claim Telegram Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DAILY · Set Report Kind": {
+      "main": [
+        [
+          {
+            "node": "DAILY · Build Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DAILY · Build Report": {
+      "main": [
+        [
+          {
+            "node": "DAILY · Telegram Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WEEKLY · Set Report Kind": {
+      "main": [
+        [
+          {
+            "node": "WEEKLY · Build Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WEEKLY · Build Report": {
+      "main": [
+        [
+          {
+            "node": "WEEKLY · Telegram Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MONTHLY · Set Report Kind": {
+      "main": [
+        [
+          {
+            "node": "MONTHLY · Build Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MONTHLY · Build Report": {
+      "main": [
+        [
+          {
+            "node": "MONTHLY · Telegram Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "02 · TRUE Independent History + Model + Bet365": {
+      "main": [
+        [
+          {
+            "node": "02 · Normalize Real Bet365 Markets",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "HTR · Capture Bet365 1H Market · RESEARCH ONLY",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "13A · Persist Funnel Analytics": {
+      "main": [
+        [
+          {
+            "node": "14 · IF Final Signal?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "20A · Build Telegram T-30 Message": {
+      "main": [
+        [
+          {
+            "node": "21 · Telegram Publish T-30",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "20 · Persist T-30 Pick": {
+      "main": [
+        [
+          {
+            "node": "20A · Build Telegram T-30 Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "33 · Reply WON LOSS to Original": {
+      "main": [
+        [
+          {
+            "node": "34 · Confirm Telegram Reply Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger · T-30 Engine 24x7 every 10m": {
+      "main": [
+        [
+          {
+            "node": "01 · Independent Upcoming Fixture Discovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "32A · Claim Telegram Reply": {
+      "main": [
+        [
+          {
+            "node": "32B · IF Reply Claimed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "32B · IF Reply Claimed?": {
+      "main": [
+        [
+          {
+            "node": "33 · Reply WON LOSS to Original",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "40 · Daily Report 06:30 · Previous Day": {
+      "main": [
+        [
+          {
+            "node": "DAILY · Set Report Kind",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "50 · Weekly Report Monday 06:35 · Previous Week": {
+      "main": [
+        [
+          {
+            "node": "WEEKLY · Set Report Kind",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "60 · Monthly Report day 1 06:40 · Previous Month": {
+      "main": [
+        [
+          {
+            "node": "MONTHLY · Set Report Kind",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "30 · Settlement every 15m · offset 09": {
+      "main": [
+        [
+          {
+            "node": "31 · Settlement Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "40 · Research Audit every 15m · offset 12": {
+      "main": [
+        [
+          {
+            "node": "41 · Build Research Audit · every 10 settled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "41 · Build Research Audit · every 10 settled": {
+      "main": [
+        [
+          {
+            "node": "42 · IF Research Audit Due?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10F · Unified Fusion Score · ALL STRATEGIES": {
+      "main": [
+        [
+          {
+            "node": "06 · FUSION Value + Price Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "06 · FUSION Value + Price Gate": {
+      "main": [
+        [
+          {
+            "node": "09 · Market Movement Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "08 · POST-FUSION Rank Quality": {
+      "main": [
+        [
+          {
+            "node": "11 · Exact Signal Deduplication",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "45 · Daily Funnel 06:25 · Rolling 24h": {
+      "main": [
+        [
+          {
+            "node": "45A · Build Daily Funnel Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 · Cross-Market Quality Pass-Through": {
+      "main": [
+        [
+          {
+            "node": "08 · POST-FUSION Rank Quality",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 · Exact Signal Deduplication": {
+      "main": [
+        [
+          {
+            "node": "12 · Exact Publication Duplicate Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 · Exact Publication Duplicate Guard": {
+      "main": [
+        [
+          {
+            "node": "13 · Build Final T-30 Signal + Diagnostics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "6ee8ae91-2515-46e9-a653-cfefeb855d33",
+  "meta": {
+    "instanceId": "a6d4814e03c696ec06e8a34c275ef5fdbe062bb542b74af36e939046e4711a88"
+  },
+  "id": "9hSPCXZxUtkFpouv",
+  "tags": []
+}
